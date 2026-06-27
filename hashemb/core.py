@@ -32,7 +32,9 @@ class HashEmbeddingFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        grad_np = grad_output.numpy()
+        # Ensure contiguous layout: grad_output may be a non-contiguous view
+        # (e.g., from strided / transposed operations).
+        grad_np = grad_output.contiguous().numpy()
         slot_np = ctx.slot_indices.numpy()
 
         # Accumulate gradients into C++ grad_buffer (no update yet).
