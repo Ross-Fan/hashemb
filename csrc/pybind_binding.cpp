@@ -36,9 +36,10 @@ class PyHashEmbedding {
                   const std::string& opt = "sgd",
                   float lr = 0.01f,
                   float beta1 = 0.9f, float beta2 = 0.999f,
-                  float eps = 1e-8f)
+                  float eps = 1e-8f, int64_t block_size = 10'000'000)
       : table_(initial_capacity, embedding_dim,
-               config_from_kwargs(opt, lr, beta1, beta2, eps)) {}
+               config_from_kwargs(opt, lr, beta1, beta2, eps),
+               block_size) {}
 
   // ── Lookup ──────────────────────────────────────────────────────────
 
@@ -180,13 +181,14 @@ PYBIND11_MODULE(_hashemb_cpp, m) {
   m.doc() = "HashEmb C++ extension";
 
   py::class_<hashemb::PyHashEmbedding>(m, "HashEmbeddingTable")
-      .def(py::init<int64_t, int32_t, std::string, float, float, float, float>(),
+      .def(py::init<int64_t, int32_t, std::string, float, float, float, float, int64_t>(),
            py::arg("capacity"), py::arg("embedding_dim"),
            py::arg("optimizer") = "sgd",
            py::arg("lr") = 0.01f,
            py::arg("beta1") = 0.9f,
            py::arg("beta2") = 0.999f,
-           py::arg("eps") = 1e-8f)
+           py::arg("eps") = 1e-8f,
+           py::arg("block_size") = 10'000'000)
 
       // Lookup
       .def("lookup_and_gather", &hashemb::PyHashEmbedding::lookup_and_gather,

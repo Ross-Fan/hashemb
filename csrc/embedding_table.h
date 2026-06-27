@@ -22,14 +22,14 @@ struct OptimizerConfig {
 // Block-based storage for embedding vectors
 // ---------------------------------------------------------------------------
 
-static constexpr int64_t kBlockSize = 10'000'000;  // 10M slots per block
+static constexpr int64_t kDefaultBlockSize = 10'000'000;  // 10M slots per block
 
-/// A single block of [kBlockSize, D] float data, allocated on demand.
+/// A single block of [block_size, D] float data, allocated on demand.
 struct Block {
   float* data = nullptr;
 
-  void allocate(int64_t dim) {
-    size_t bytes = static_cast<size_t>(kBlockSize) *
+  void allocate(int64_t block_size, int64_t dim) {
+    size_t bytes = static_cast<size_t>(block_size) *
                    static_cast<size_t>(dim) * sizeof(float);
     void* p = nullptr;
     if (posix_memalign(&p, 64, bytes) != 0) throw std::bad_alloc();
@@ -45,10 +45,10 @@ struct Block {
   }
 };
 
-/// Get pointer to slot `slot_id` within a block vector.
-inline float* slot_ptr(const std::vector<Block>& blocks, int64_t slot_id, int32_t D) {
-  int64_t block_id = slot_id / kBlockSize;
-  int64_t offset = slot_id % kBlockSize;
+/// Get pointer to slot `slot_id` within a block vector using given block_size.
+inline float* slot_ptr(const std::vector<Block>& blocks, int64_t slot_id, int32_t D, int64_t block_size) {
+  int64_t block_id = slot_id / block_size;
+  int64_t offset = slot_id % block_size;
   return blocks[block_id].data + offset * D;
 }
 
@@ -56,10 +56,10 @@ inline float* slot_ptr(const std::vector<Block>& blocks, int64_t slot_id, int32_
 /// accumulation and native optimizers.
 ///
 /// Memory layout (block chain, allocated on demand):
-///   emb_blocks_   [n_blocks][kBlockSize, D]  ← embedding vectors
-///   grad_blocks_  [n_blocks][kBlockSize, D]  ← accumulated gradients
-///   m_blocks_     [n_blocks][kBlockSize, D]  ← Adam 1st moment (ADAM only)
-///   v_blocks_     [n_blocks][kBlockSize, D]  ← Adam 2nd moment (ADAM only)
+///   emb_blocks_   [n_blocks][block_size, D]  ← embedding vectors
+///   grad_blocks_  [n_blocks][block_size, D]  ← accumulated gradients
+///   m_blocks_     [n_blocks][block_size, D]  ← Adam 1st moment (ADAM only)
+///   v_blocks_     [n_blocks][block_size, D]  ← Adam 2nd moment (ADAM only)
 ///   t_                                       ← Adam timestep
 ///
 /// Data flow:
@@ -69,7 +69,8 @@ inline float* slot_ptr(const std::vector<Block>& blocks, int64_t slot_id, int32_
 class EmbeddingTable {
  public:
   EmbeddingTable(int64_t initial_capacity, int32_t embedding_dim,
-                 const OptimizerConfig& opt_cfg = OptimizerConfig{});
+                 const OptimizerConfig& opt_cfg = OptimizerConfig{},
+                 int64_t block_size = kDefaultBlockSize);
   ~EmbeddingTable();
 
   EmbeddingTable(const EmbeddingTable&) = delete;
@@ -140,6 +141,7 @@ class EmbeddingTable {
 
   int64_t initial_capacity_;
   int32_t embedding_dim_;
+  int64_t block_size_;
   OptimizerConfig opt_cfg_;
 
   // Block-based storage (allocated on demand via ensure_slot)
