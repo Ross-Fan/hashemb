@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+*.so
+*.egg-info/
+__pycache__/
+.pytest_cache/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Claude
+.claude/
