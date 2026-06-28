@@ -1,6 +1,7 @@
 #include "hash_table.h"
 #include <cstring>
 #include <stdexcept>
+#include <limits>
 #include <unordered_map>
 
 namespace hashemb {
@@ -11,11 +12,9 @@ namespace hashemb {
 
 void Bucket::allocate(int32_t cap) {
   capacity = cap;
-  keys = new int64_t[cap];
-  slot_indices = new int32_t[cap];
-  dists = new int32_t[cap];
-  std::memset(keys, 0xFF, sizeof(int64_t) * cap);   // -1 = empty
-  std::memset(dists, 0, sizeof(int32_t) * cap);
+  keys.assign(cap, -1LL);          // -1 = empty
+  slot_indices.resize(cap);        // 0-initialised, insert() will overwrite
+  dists.assign(cap, 0);            // probe distance 0
 }
 
 bool Bucket::insert(int64_t key, int32_t slot_idx) {
@@ -55,17 +54,22 @@ bool Bucket::insert(int64_t key, int32_t slot_idx) {
 }
 
 void Bucket::grow() {
-  int32_t new_cap = capacity * 2;
-  auto* new_keys = new int64_t[new_cap];
-  auto* new_slots = new int32_t[new_cap];
-  auto* new_dists = new int32_t[new_cap];
-  std::memset(new_keys, 0xFF, sizeof(int64_t) * new_cap);
-  std::memset(new_dists, 0, sizeof(int32_t) * new_cap);
+  // Guard against int32_t overflow.
+  int32_t new_cap;
+  if (capacity > std::numeric_limits<int32_t>::max() / 2) {
+    throw std::overflow_error("Bucket capacity overflow in grow()");
+  }
+  new_cap = capacity * 2;
 
-  int32_t old_cap = capacity;
+  // Local vectors: if any allocation throws, previously allocated ones
+  // are automatically destroyed — no leak.
+  std::vector<int64_t> new_keys(new_cap, -1LL);
+  std::vector<int32_t> new_slots(new_cap);
+  std::vector<int32_t> new_dists(new_cap, 0);
+
   int32_t new_mask = new_cap - 1;
 
-  for (int32_t i = 0; i < old_cap; ++i) {
+  for (int32_t i = 0; i < capacity; ++i) {
     if (keys[i] == -1) continue;
 
     int64_t key = keys[i];
@@ -91,12 +95,10 @@ void Bucket::grow() {
     }
   }
 
-  delete[] keys;
-  delete[] slot_indices;
-  delete[] dists;
-  keys = new_keys;
-  slot_indices = new_slots;
-  dists = new_dists;
+  // Commit — noexcept (vector move is noexcept, integral assignments noexcept).
+  keys = std::move(new_keys);
+  slot_indices = std::move(new_slots);
+  dists = std::move(new_dists);
   capacity = new_cap;
   // size stays the same
 }
@@ -208,6 +210,18 @@ std::vector<std::pair<int64_t, int32_t>> HashTable::dump() const {
       if (buckets_[b].keys[i] != -1) {
         result.emplace_back(buckets_[b].keys[i], buckets_[b].slot_indices[i]);
       }
+    }
+  }
+  return result;
+}
+
+std::vector<std::pair<int64_t, int32_t>> HashTable::dump_bucket(int bucket_idx) const {
+  std::vector<std::pair<int64_t, int32_t>> result;
+  std::shared_lock lock(buckets_[bucket_idx].mtx);
+  result.reserve(buckets_[bucket_idx].size);
+  for (int32_t i = 0; i < buckets_[bucket_idx].capacity; ++i) {
+    if (buckets_[bucket_idx].keys[i] != -1) {
+      result.emplace_back(buckets_[bucket_idx].keys[i], buckets_[bucket_idx].slot_indices[i]);
     }
   }
   return result;

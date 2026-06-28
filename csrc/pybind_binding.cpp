@@ -97,6 +97,11 @@ class PyHashEmbedding {
   void step() { table_.step(); }
   void zero_grad() { table_.zero_grad(); }
 
+  // ── Binary save / load ────────────────────────────────────────
+
+  void save(const std::string& path) const { table_.save(path); }
+  void load(const std::string& path) { table_.load(path); }
+
   // ── Serialisation ───────────────────────────────────────────────────
 
   py::dict state_dict() {
@@ -208,6 +213,10 @@ PYBIND11_MODULE(_hashemb_cpp, m) {
       .def("state_dict", &hashemb::PyHashEmbedding::state_dict)
       .def("load_state_dict", &hashemb::PyHashEmbedding::load_state_dict,
            py::arg("state_dict"))
+
+      // Binary save/load (bucket-by-bucket, zero extra memory)
+      .def("save", &hashemb::PyHashEmbedding::save, py::arg("path"))
+      .def("load", &hashemb::PyHashEmbedding::load, py::arg("path"))
 
       // Properties
       .def_property_readonly("capacity", &hashemb::PyHashEmbedding::capacity)

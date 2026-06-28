@@ -12,25 +12,18 @@ constexpr int kNumBuckets = 16;
 
 /// Per-bucket data for Robin Hood open-addressing hash map.
 struct Bucket {
-  int64_t* keys = nullptr;
-  int32_t* slot_indices = nullptr;
-  int32_t* dists = nullptr;      // probe distance from home
-  int32_t capacity = 0;          // allocated capacity
-  int32_t size = 0;              // live entries
+  std::vector<int64_t> keys;           // [capacity]; -1 = empty
+  std::vector<int32_t> slot_indices;   // [capacity]
+  std::vector<int32_t> dists;          // [capacity]; probe distance from home
+  int32_t capacity = 0;                // allocated capacity
+  int32_t size = 0;                    // live entries
   mutable std::shared_mutex mtx;
 
   Bucket() = default;
   Bucket(const Bucket&) = delete;
   Bucket& operator=(const Bucket&) = delete;
 
-  ~Bucket() {
-    delete[] keys;
-    delete[] slot_indices;
-    delete[] dists;
-    keys = nullptr;
-    slot_indices = nullptr;
-    dists = nullptr;
-  }
+  // No destructor needed — vectors handle cleanup automatically.
 
   void allocate(int32_t cap);
   bool insert(int64_t key, int32_t slot_idx);
@@ -52,6 +45,9 @@ class HashTable {
 
   /// Get all (key, slot_index) pairs currently stored.
   std::vector<std::pair<int64_t, int32_t>> dump() const;
+
+  /// Get entries in a single bucket (avoids allocating a vector for all 16 buckets).
+  std::vector<std::pair<int64_t, int32_t>> dump_bucket(int bucket_idx) const;
 
   /// Bulk-insert pre-existing entries (used when loading a checkpoint).
   /// Keys must NOT already exist.  Returns number of entries inserted.

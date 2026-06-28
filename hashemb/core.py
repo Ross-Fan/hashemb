@@ -141,6 +141,22 @@ class HashEmbedding(torch.nn.Module):
 
     # ── Checkpoint ─────────────────────────────────────────────────────
 
+    def save(self, path: str):
+        """Save hash table to binary file (bucket-by-bucket, zero extra memory).
+
+        Args:
+            path: File path to write.
+        """
+        self._table.save(path)
+
+    def load(self, path: str):
+        """Load hash table from binary file written by :meth:`save`.
+
+        Args:
+            path: File path to read.
+        """
+        self._table.load(path)
+
     def state_dict(self, *args, **kwargs):
         """Return the hash table state as a dict of CPU ``torch.Tensor``.
 

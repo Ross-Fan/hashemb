@@ -1,6 +1,7 @@
 #include "embedding_table.h"
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 #include <algorithm>
 #include <utility>
@@ -50,6 +51,11 @@ void EmbeddingTable::ensure_slot(int64_t slot_id) {
       v_blocks_.emplace_back();
       v_blocks_.back().allocate(block_size_, embedding_dim_);
     }
+  }
+  // Grow slot_dirty_ to cover the new block's slots.
+  int64_t total_slots = needed * block_size_;
+  if (slot_dirty_.size() < static_cast<size_t>(total_slots)) {
+    slot_dirty_.resize(total_slots, false);
   }
 }
 
@@ -116,6 +122,12 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
     int64_t j = i;
     while (j < n && slot_indices[idx[j]] == slot) ++j;
 
+    // Mark slot as dirty (first time this step cycle).
+    if (!slot_dirty_[slot]) {
+      slot_dirty_[slot] = true;
+      dirty_slots_.push_back(slot);
+    }
+
     float* grad_dst = slot_ptr(grad_blocks_, slot, D, block_size_);
     for (int64_t k = i; k < j; ++k) {
       const float* g = grads + idx[k] * D;
@@ -132,66 +144,33 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
 
 void EmbeddingTable::zero_grad() {
   int32_t D = embedding_dim_;
-  int64_t n = hash_table_.num_entries();
-  // Only zero the portion of the first block that has been used.
-  // This avoids a massive memset on the full block_size buffer.
-  int64_t bs = block_size_;
-  if (!grad_blocks_.empty() && grad_blocks_[0].data && n > 0) {
-    // For block 0: n entries might span into the next block.
-    // Zero from 0 to min(n, bs) entries in block 0.
-    int64_t zero_count = (n < bs) ? n : bs;
-    std::memset(grad_blocks_[0].data, 0,
-                static_cast<size_t>(zero_count) * D * sizeof(float));
-    // If entries span beyond block 0, zero remaining blocks entirely.
-    if (n > bs) {
-      int64_t n_full_blocks = (n - 1) / bs;  // last block index
-      for (int64_t b = 1; b <= n_full_blocks; ++b) {
-        if (b < static_cast<int64_t>(grad_blocks_.size()) && grad_blocks_[b].data) {
-          int64_t this_count = (b == n_full_blocks) ? (n - b * bs) : bs;
-          std::memset(grad_blocks_[b].data, 0,
-                      static_cast<size_t>(this_count) * D * sizeof(float));
-        }
-      }
-    }
+
+  // Zero gradient memory for dirty slots only.
+  for (int32_t slot : dirty_slots_) {
+    float* g = slot_ptr(grad_blocks_, slot, D, block_size_);
+    std::memset(g, 0, static_cast<size_t>(D) * sizeof(float));
+    slot_dirty_[slot] = false;
   }
+  dirty_slots_.clear();
 }
 
 void EmbeddingTable::step() {
   int32_t D = embedding_dim_;
-  int64_t n = hash_table_.num_entries();
-  if (n == 0) return;
-
-  // Ensure all blocks up to the last slot exist.
-  ensure_slot(n - 1);
-
-  // Pre-compute base pointers to avoid slot_ptr division/call overhead.
-  // All entries are in the first block when n <= block_size.
   int64_t bs = block_size_;
-  float* w_base0 = emb_blocks_.empty() ? nullptr : emb_blocks_[0].data;
-  float* g_base0 = grad_blocks_.empty() ? nullptr : grad_blocks_[0].data;
+  size_t ndirty = dirty_slots_.size();
+  if (ndirty == 0) return;
 
   if (opt_cfg_.type == OptimizerConfig::SGD) {
     float lr = opt_cfg_.lr;
-    if (n <= bs && w_base0 && g_base0) {
-      // Fast path: all entries in block 0, direct pointer arithmetic.
-      for (int64_t slot = 0; slot < n; ++slot) {
-        float* w = w_base0 + slot * D;
-        float* g = g_base0 + slot * D;
-        for (int32_t d = 0; d < D; ++d) {
-          w[d] -= lr * g[d];
-          g[d] = 0.0f;
-        }
+    for (size_t di = 0; di < ndirty; ++di) {
+      int32_t slot = dirty_slots_[di];
+      float* w = slot_ptr(emb_blocks_, slot, D, bs);
+      float* g = slot_ptr(grad_blocks_, slot, D, bs);
+      for (int32_t d = 0; d < D; ++d) {
+        w[d] -= lr * g[d];
+        g[d] = 0.0f;
       }
-    } else {
-      // General path: entries may span multiple blocks.
-      for (int64_t slot = 0; slot < n; ++slot) {
-        float* w = slot_ptr(emb_blocks_, slot, D, bs);
-        float* g = slot_ptr(grad_blocks_, slot, D, bs);
-        for (int32_t d = 0; d < D; ++d) {
-          w[d] -= lr * g[d];
-          g[d] = 0.0f;
-        }
-      }
+      slot_dirty_[slot] = false;
     }
   } else if (opt_cfg_.type == OptimizerConfig::ADAM) {
     ++t_;
@@ -202,48 +181,27 @@ void EmbeddingTable::step() {
     float bias_corr1 = 1.0f - std::pow(b1, static_cast<float>(t_));
     float bias_corr2 = 1.0f - std::pow(b2, static_cast<float>(t_));
 
-    float* m_base0 = m_blocks_.empty() ? nullptr : m_blocks_[0].data;
-    float* v_base0 = v_blocks_.empty() ? nullptr : v_blocks_[0].data;
+    for (size_t di = 0; di < ndirty; ++di) {
+      int32_t slot = dirty_slots_[di];
+      float* w = slot_ptr(emb_blocks_, slot, D, bs);
+      float* g = slot_ptr(grad_blocks_, slot, D, bs);
+      float* m = slot_ptr(m_blocks_, slot, D, bs);
+      float* v = slot_ptr(v_blocks_, slot, D, bs);
 
-    if (n <= bs && w_base0 && g_base0 && m_base0 && v_base0) {
-      // Fast path: all entries in block 0, direct pointer arithmetic.
-      for (int64_t slot = 0; slot < n; ++slot) {
-        float* w = w_base0 + slot * D;
-        float* g = g_base0 + slot * D;
-        float* m = m_base0 + slot * D;
-        float* v = v_base0 + slot * D;
-
-        for (int32_t d = 0; d < D; ++d) {
-          float gd = g[d];
-          m[d] = b1 * m[d] + (1.0f - b1) * gd;
-          v[d] = b2 * v[d] + (1.0f - b2) * gd * gd;
-          float m_hat = m[d] / bias_corr1;
-          float v_hat = v[d] / bias_corr2;
-          w[d] -= lr * m_hat / (std::sqrt(v_hat) + eps);
-          g[d] = 0.0f;
-        }
+      for (int32_t d = 0; d < D; ++d) {
+        float gd = g[d];
+        m[d] = b1 * m[d] + (1.0f - b1) * gd;
+        v[d] = b2 * v[d] + (1.0f - b2) * gd * gd;
+        float m_hat = m[d] / bias_corr1;
+        float v_hat = v[d] / bias_corr2;
+        w[d] -= lr * m_hat / (std::sqrt(v_hat) + eps);
+        g[d] = 0.0f;
       }
-    } else {
-      // General path: entries may span multiple blocks.
-      for (int64_t slot = 0; slot < n; ++slot) {
-        float* w = slot_ptr(emb_blocks_, slot, D, bs);
-        float* g = slot_ptr(grad_blocks_, slot, D, bs);
-        float* m = slot_ptr(m_blocks_, slot, D, bs);
-        float* v = slot_ptr(v_blocks_, slot, D, bs);
-
-        for (int32_t d = 0; d < D; ++d) {
-          float gd = g[d];
-          m[d] = b1 * m[d] + (1.0f - b1) * gd;
-          v[d] = b2 * v[d] + (1.0f - b2) * gd * gd;
-          float m_hat = m[d] / bias_corr1;
-          float v_hat = v[d] / bias_corr2;
-          w[d] -= lr * m_hat / (std::sqrt(v_hat) + eps);
-          g[d] = 0.0f;
-        }
-      }
+      slot_dirty_[slot] = false;
     }
   }
 
+  dirty_slots_.clear();
   // Note: gradients zeroed in-place above — no separate zero_grad() call needed.
 }
 
@@ -330,6 +288,160 @@ void EmbeddingTable::load_state_dict_arrays(
       std::memcpy(slot_ptr(v_blocks_, slot, D, block_size_), v + i * D, sizeof(float) * D);
     }
   }
+}
+
+// ===========================================================================
+// Binary save / load (bucket-by-bucket, zero extra memory allocation)
+// ===========================================================================
+
+void EmbeddingTable::save(const std::string& path) const {
+  FILE* fp = std::fopen(path.c_str(), "wb");
+  if (!fp) throw std::runtime_error("Cannot open " + path + " for writing");
+
+  int32_t D = embedding_dim_;
+  int64_t bs = block_size_;
+  int64_t n_total = hash_table_.num_entries();
+  bool is_adam = (opt_cfg_.type == OptimizerConfig::ADAM);
+
+  // ── Header ─────────────────────────────────────────────────────
+  // magic (8 bytes) + version (int32)
+  std::fwrite("HASHEMB", 1, 8, fp);
+  int32_t version = 0;
+  std::fwrite(&version, sizeof(version), 1, fp);
+
+  // num_entries, dim, opt_type (padded to 8 bytes)
+  std::fwrite(&n_total, sizeof(n_total), 1, fp);
+  std::fwrite(&D, sizeof(D), 1, fp);
+  char opt_buf[8] = {};
+  std::strncpy(opt_buf, is_adam ? "adam" : "sgd", 7);
+  std::fwrite(opt_buf, 1, 8, fp);
+
+  // Optimizer hyper-params
+  std::fwrite(&opt_cfg_.lr,     sizeof(float), 1, fp);
+  std::fwrite(&opt_cfg_.beta1,  sizeof(float), 1, fp);
+  std::fwrite(&opt_cfg_.beta2,  sizeof(float), 1, fp);
+  std::fwrite(&opt_cfg_.eps,    sizeof(float), 1, fp);
+  std::fwrite(&t_, sizeof(t_), 1, fp);
+  std::fwrite(&bs,  sizeof(bs), 1, fp);
+
+  // ── Bucket sections ────────────────────────────────────────────
+  // Each bucket: n_entries(int64) + bucket_id(int32)
+  //   then n_entries × [key(int64) + slot(int32) + weight(float[D])
+  //                     + grad(float[D]) + m(float[D]) + v(float[D])]
+  for (int b = 0; b < kNumBuckets; ++b) {
+    auto entries = hash_table_.dump_bucket(b);
+    int64_t nb = static_cast<int64_t>(entries.size());
+    std::fwrite(&nb, sizeof(nb), 1, fp);
+    int32_t bid = b;
+    std::fwrite(&bid, sizeof(bid), 1, fp);
+
+    for (const auto& e : entries) {
+      int64_t key = e.first;
+      int32_t slot = e.second;
+
+      std::fwrite(&key,  sizeof(key),  1, fp);
+      std::fwrite(&slot, sizeof(slot), 1, fp);
+      std::fwrite(slot_ptr(emb_blocks_, slot, D, bs), sizeof(float), D, fp);
+      std::fwrite(slot_ptr(grad_blocks_, slot, D, bs), sizeof(float), D, fp);
+      if (is_adam) {
+        std::fwrite(slot_ptr(m_blocks_, slot, D, bs), sizeof(float), D, fp);
+        std::fwrite(slot_ptr(v_blocks_, slot, D, bs), sizeof(float), D, fp);
+      }
+    }
+  }
+
+  std::fclose(fp);
+}
+
+void EmbeddingTable::load(const std::string& path) {
+  FILE* fp = std::fopen(path.c_str(), "rb");
+  if (!fp) throw std::runtime_error("Cannot open " + path + " for reading");
+
+  // ── Header ─────────────────────────────────────────────────────
+  char magic[8];
+  std::fread(magic, 1, 8, fp);
+  if (std::strncmp(magic, "HASHEMB", 7) != 0) {
+    std::fclose(fp);
+    throw std::runtime_error("Invalid hash table file: " + path);
+  }
+
+  int32_t version;
+  std::fread(&version, sizeof(version), 1, fp);
+  (void)version;  // reserved for future format versions
+
+  int64_t file_n;
+  int32_t file_D;
+  char opt_buf[8];
+  std::fread(&file_n, sizeof(file_n), 1, fp);
+  std::fread(&file_D, sizeof(file_D), 1, fp);
+  std::fread(opt_buf, 1, 8, fp);
+
+  if (file_D != embedding_dim_) {
+    std::fclose(fp);
+    throw std::runtime_error("Embedding dimension mismatch: "
+                             + std::to_string(file_D) + " vs " + std::to_string(embedding_dim_));
+  }
+
+  float file_lr, file_beta1, file_beta2, file_eps;
+  int64_t file_t, file_bs;
+  std::fread(&file_lr,    sizeof(float), 1, fp);
+  std::fread(&file_beta1, sizeof(float), 1, fp);
+  std::fread(&file_beta2, sizeof(float), 1, fp);
+  std::fread(&file_eps,   sizeof(float), 1, fp);
+  std::fread(&file_t,     sizeof(file_t), 1, fp);
+  std::fread(&file_bs,    sizeof(file_bs), 1, fp);
+
+  // Restore optimizer config from file.
+  std::string file_opt(opt_buf);
+  file_opt = std::string(file_opt.c_str());  // trim at null
+  if (file_opt == "adam") {
+    opt_cfg_.type = OptimizerConfig::ADAM;
+    opt_cfg_.lr    = file_lr;
+    opt_cfg_.beta1 = file_beta1;
+    opt_cfg_.beta2 = file_beta2;
+    opt_cfg_.eps   = file_eps;
+  } else {
+    opt_cfg_.type = OptimizerConfig::SGD;
+    opt_cfg_.lr = file_lr;
+  }
+  t_ = file_t;
+
+  int32_t D = embedding_dim_;
+  int64_t bs = block_size_;
+  bool is_adam = (opt_cfg_.type == OptimizerConfig::ADAM);
+
+  // ── Bucket sections ────────────────────────────────────────────
+  // For each entry: read key, insert via find_or_create to get the
+  // correct slot for the current table state, then read weight/grad/m/v
+  // directly into the block buffer (zero extra allocation).
+  for (int b = 0; b < kNumBuckets; ++b) {
+    int64_t nb;
+    int32_t bid;
+    std::fread(&nb,  sizeof(nb),  1, fp);
+    std::fread(&bid, sizeof(bid), 1, fp);
+
+    for (int64_t i = 0; i < nb; ++i) {
+      int64_t key;
+      int32_t saved_slot;  // saved slot ID (informational, not used)
+      std::fread(&key,        sizeof(key),        1, fp);
+      std::fread(&saved_slot, sizeof(saved_slot), 1, fp);
+
+      // Insert key into hash table → get current slot.
+      int32_t slot;
+      hash_table_.find_or_create(&key, &slot, 1);
+      ensure_slot(slot);
+
+      // Read data directly into block buffer (zero-copy from disk).
+      std::fread(slot_ptr(emb_blocks_, slot, D, bs),   sizeof(float), D, fp);
+      std::fread(slot_ptr(grad_blocks_, slot, D, bs),  sizeof(float), D, fp);
+      if (is_adam) {
+        std::fread(slot_ptr(m_blocks_, slot, D, bs),   sizeof(float), D, fp);
+        std::fread(slot_ptr(v_blocks_, slot, D, bs),   sizeof(float), D, fp);
+      }
+    }
+  }
+
+  std::fclose(fp);
 }
 
 }  // namespace hashemb

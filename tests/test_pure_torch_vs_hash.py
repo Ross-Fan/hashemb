@@ -51,7 +51,7 @@ def manual_sgd(weight, grad, lr):
 
 
 def manual_adam(weight, grad, m, v, t, lr, beta1=0.9, beta2=0.999, eps=1e-8):
-    """Matches C++ Adam (embedding_table.cpp:152-158)."""
+    """Matches C++ dense Adam (all entries updated)."""
     m.data = beta1 * m + (1 - beta1) * grad
     v.data = beta2 * v + (1 - beta2) * grad * grad
     bias_corr1 = 1.0 - beta1 ** t
@@ -59,6 +59,27 @@ def manual_adam(weight, grad, m, v, t, lr, beta1=0.9, beta2=0.999, eps=1e-8):
     m_hat = m / bias_corr1
     v_hat = v / bias_corr2
     weight.data -= lr * m_hat / (v_hat.sqrt() + eps)
+
+
+def manual_adam_sparse(weight, grad, m, v, t, lr, touched_slots,
+                       beta1=0.9, beta2=0.999, eps=1e-8):
+    """Matches HashEmb sparse Adam: only updates slots that were touched this batch.
+
+    This is the correct reference for dirty-tracking step() — non-touched
+    slots keep their m/v unchanged (no decay), matching PyTorch sparse Adam.
+    """
+    bias_corr1 = 1.0 - beta1 ** t
+    bias_corr2 = 1.0 - beta2 ** t
+    wd = weight.data
+    for slot in touched_slots:
+        g = grad[slot]
+        ms = m[slot]
+        vs = v[slot]
+        ms.mul_(beta1).add_(g, alpha=1 - beta1)
+        vs.mul_(beta2).add_(g * g, alpha=1 - beta2)
+        m_hat = ms / bias_corr1
+        v_hat = vs / bias_corr2
+        wd[slot] -= lr * m_hat / (v_hat.sqrt() + eps)
 
 
 # ===========================================================================
@@ -185,8 +206,11 @@ class TestComparePureTorchVsHashEmb:
                 manual_sgd(ref_emb.embedding.weight, grad_ref, self.LR)
             else:
                 ref_t += 1
-                manual_adam(ref_emb.embedding.weight, grad_ref,
-                            ref_m, ref_v, ref_t, self.LR)
+                # Use sparse Adam — only update batch-touched slots,
+                # matching HashEmb's dirty-tracking step().
+                touched = x.unique().tolist()
+                manual_adam_sparse(ref_emb.embedding.weight, grad_ref,
+                                   ref_m, ref_v, ref_t, self.LR, touched)
             ref_emb.embedding.weight.grad.zero_()  # match HashEmb's auto-zero
             ref_dense_opt.step()
 
