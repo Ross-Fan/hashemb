@@ -132,29 +132,65 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
 
 void EmbeddingTable::zero_grad() {
   int32_t D = embedding_dim_;
-  for (auto& block : grad_blocks_) {
-    if (block.data) {
-      std::memset(block.data, 0, static_cast<size_t>(block_size_) * D * sizeof(float));
+  int64_t n = hash_table_.num_entries();
+  // Only zero the portion of the first block that has been used.
+  // This avoids a massive memset on the full block_size buffer.
+  int64_t bs = block_size_;
+  if (!grad_blocks_.empty() && grad_blocks_[0].data && n > 0) {
+    // For block 0: n entries might span into the next block.
+    // Zero from 0 to min(n, bs) entries in block 0.
+    int64_t zero_count = (n < bs) ? n : bs;
+    std::memset(grad_blocks_[0].data, 0,
+                static_cast<size_t>(zero_count) * D * sizeof(float));
+    // If entries span beyond block 0, zero remaining blocks entirely.
+    if (n > bs) {
+      int64_t n_full_blocks = (n - 1) / bs;  // last block index
+      for (int64_t b = 1; b <= n_full_blocks; ++b) {
+        if (b < static_cast<int64_t>(grad_blocks_.size()) && grad_blocks_[b].data) {
+          int64_t this_count = (b == n_full_blocks) ? (n - b * bs) : bs;
+          std::memset(grad_blocks_[b].data, 0,
+                      static_cast<size_t>(this_count) * D * sizeof(float));
+        }
+      }
     }
   }
 }
 
 void EmbeddingTable::step() {
   int32_t D = embedding_dim_;
-  int64_t bs = block_size_;
-  int64_t n = num_entries();
+  int64_t n = hash_table_.num_entries();
   if (n == 0) return;
 
   // Ensure all blocks up to the last slot exist.
   ensure_slot(n - 1);
 
+  // Pre-compute base pointers to avoid slot_ptr division/call overhead.
+  // All entries are in the first block when n <= block_size.
+  int64_t bs = block_size_;
+  float* w_base0 = emb_blocks_.empty() ? nullptr : emb_blocks_[0].data;
+  float* g_base0 = grad_blocks_.empty() ? nullptr : grad_blocks_[0].data;
+
   if (opt_cfg_.type == OptimizerConfig::SGD) {
     float lr = opt_cfg_.lr;
-    for (int64_t slot = 0; slot < n; ++slot) {
-      float* w = slot_ptr(emb_blocks_, slot, D, block_size_);
-      float* g = slot_ptr(grad_blocks_, slot, D, bs);
-      for (int32_t d = 0; d < D; ++d) {
-        w[d] -= lr * g[d];
+    if (n <= bs && w_base0 && g_base0) {
+      // Fast path: all entries in block 0, direct pointer arithmetic.
+      for (int64_t slot = 0; slot < n; ++slot) {
+        float* w = w_base0 + slot * D;
+        float* g = g_base0 + slot * D;
+        for (int32_t d = 0; d < D; ++d) {
+          w[d] -= lr * g[d];
+          g[d] = 0.0f;
+        }
+      }
+    } else {
+      // General path: entries may span multiple blocks.
+      for (int64_t slot = 0; slot < n; ++slot) {
+        float* w = slot_ptr(emb_blocks_, slot, D, bs);
+        float* g = slot_ptr(grad_blocks_, slot, D, bs);
+        for (int32_t d = 0; d < D; ++d) {
+          w[d] -= lr * g[d];
+          g[d] = 0.0f;
+        }
       }
     }
   } else if (opt_cfg_.type == OptimizerConfig::ADAM) {
@@ -166,24 +202,49 @@ void EmbeddingTable::step() {
     float bias_corr1 = 1.0f - std::pow(b1, static_cast<float>(t_));
     float bias_corr2 = 1.0f - std::pow(b2, static_cast<float>(t_));
 
-    for (int64_t slot = 0; slot < n; ++slot) {
-      float* w = slot_ptr(emb_blocks_, slot, D, block_size_);
-      float* g = slot_ptr(grad_blocks_, slot, D, bs);
-      float* m = slot_ptr(m_blocks_, slot, D, block_size_);
-      float* v = slot_ptr(v_blocks_, slot, D, block_size_);
+    float* m_base0 = m_blocks_.empty() ? nullptr : m_blocks_[0].data;
+    float* v_base0 = v_blocks_.empty() ? nullptr : v_blocks_[0].data;
 
-      for (int32_t d = 0; d < D; ++d) {
-        m[d] = b1 * m[d] + (1.0f - b1) * g[d];
-        v[d] = b2 * v[d] + (1.0f - b2) * g[d] * g[d];
-        float m_hat = m[d] / bias_corr1;
-        float v_hat = v[d] / bias_corr2;
-        w[d] -= lr * m_hat / (std::sqrt(v_hat) + eps);
+    if (n <= bs && w_base0 && g_base0 && m_base0 && v_base0) {
+      // Fast path: all entries in block 0, direct pointer arithmetic.
+      for (int64_t slot = 0; slot < n; ++slot) {
+        float* w = w_base0 + slot * D;
+        float* g = g_base0 + slot * D;
+        float* m = m_base0 + slot * D;
+        float* v = v_base0 + slot * D;
+
+        for (int32_t d = 0; d < D; ++d) {
+          float gd = g[d];
+          m[d] = b1 * m[d] + (1.0f - b1) * gd;
+          v[d] = b2 * v[d] + (1.0f - b2) * gd * gd;
+          float m_hat = m[d] / bias_corr1;
+          float v_hat = v[d] / bias_corr2;
+          w[d] -= lr * m_hat / (std::sqrt(v_hat) + eps);
+          g[d] = 0.0f;
+        }
+      }
+    } else {
+      // General path: entries may span multiple blocks.
+      for (int64_t slot = 0; slot < n; ++slot) {
+        float* w = slot_ptr(emb_blocks_, slot, D, bs);
+        float* g = slot_ptr(grad_blocks_, slot, D, bs);
+        float* m = slot_ptr(m_blocks_, slot, D, bs);
+        float* v = slot_ptr(v_blocks_, slot, D, bs);
+
+        for (int32_t d = 0; d < D; ++d) {
+          float gd = g[d];
+          m[d] = b1 * m[d] + (1.0f - b1) * gd;
+          v[d] = b2 * v[d] + (1.0f - b2) * gd * gd;
+          float m_hat = m[d] / bias_corr1;
+          float v_hat = v[d] / bias_corr2;
+          w[d] -= lr * m_hat / (std::sqrt(v_hat) + eps);
+          g[d] = 0.0f;
+        }
       }
     }
   }
 
-  // Clear gradients after applying.
-  zero_grad();
+  // Note: gradients zeroed in-place above — no separate zero_grad() call needed.
 }
 
 // ===========================================================================
