@@ -22,7 +22,7 @@ struct OptimizerConfig {
 // Block-based storage for embedding vectors
 // ---------------------------------------------------------------------------
 
-static constexpr int64_t kDefaultBlockSize = 10'000'000;  // 10M slots per block
+static constexpr int64_t kDefaultBlockSize = 1'000'000;  // 1M slots per block
 
 /// A single block of [block_size, D] float data, allocated on demand.
 struct Block {

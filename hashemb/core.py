@@ -78,7 +78,7 @@ class HashEmbedding(torch.nn.Module):
                  lr: float = 0.01,
                  beta1: float = 0.9, beta2: float = 0.999,
                  eps: float = 1e-8,
-                 block_size: int = 10_000_000):
+                 block_size: int = 1_000_000):
         super().__init__()
         if embedding_dim < 1:
             raise ValueError("embedding_dim must be ≥ 1")
