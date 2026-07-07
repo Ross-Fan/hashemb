@@ -138,64 +138,81 @@ HashTable::HashTable(int64_t initial_capacity_hint) {
 int64_t HashTable::find_or_create(const int64_t* keys, int32_t* slot_indices, int64_t n) {
   int64_t new_count = 0;
 
-  // Batch-local map to handle duplicate keys within the same call.
-  std::unordered_map<int64_t, int32_t> batch_map;
-  batch_map.reserve(n);
+  // ── Step 1: Partition keys by bucket ─────────────────────────────
+  // bucket_groups[b] = vector of (original_index, key) for keys that
+  // hash to bucket b.  Negative keys are handled inline.
+  struct IndexedKey { int64_t idx; int64_t key; };
+  std::vector<IndexedKey> bucket_groups[kNumBuckets];
+  for (int b = 0; b < kNumBuckets; ++b) {
+    bucket_groups[b].reserve(static_cast<size_t>(n / kNumBuckets + 16));
+  }
 
   for (int64_t i = 0; i < n; ++i) {
     int64_t key = keys[i];
     if (key < 0) {
-      slot_indices[i] = -1;  // sentinel for padding
+      slot_indices[i] = -1;
       continue;
     }
-
-    // Already resolved in this batch?
-    {
-      auto it = batch_map.find(key);
-      if (it != batch_map.end()) {
-        slot_indices[i] = it->second;
-        continue;
-      }
-    }
-
     int b = static_cast<int>(key & 0xF);
+    bucket_groups[b].push_back({i, key});
+  }
 
-    // Try shared (read) lock first.
+  // ── Step 2: Process each bucket with single lock acquire ─────────
+  for (int b = 0; b < kNumBuckets; ++b) {
+    auto& group = bucket_groups[b];
+    if (group.empty()) continue;
+
+    // key_to_slot: maps key → slot_index.
+    // slot = -1 means "key not in hash table, needs insertion".
+    std::unordered_map<int64_t, int32_t> key_to_slot;
+    key_to_slot.reserve(group.size());
+
+    // Which unique keys need to be inserted (slot = -1 in map).
+    std::vector<int64_t> pending_inserts;
+
+    // ── Pass 1: shared (read) lock, resolve all keys in this bucket
     {
       std::shared_lock lock(buckets_[b].mtx);
-      int32_t* found = buckets_[b].find(key);
-      if (found) {
-        slot_indices[i] = *found;
-        batch_map[key] = *found;
-        continue;
+      for (const auto& ik : group) {
+        auto it = key_to_slot.find(ik.key);
+        if (it != key_to_slot.end()) continue;  // dedup
+
+        int32_t* found = buckets_[b].find(ik.key);
+        if (found) {
+          key_to_slot[ik.key] = *found;
+        } else {
+          key_to_slot[ik.key] = -1;            // needs insert
+          pending_inserts.push_back(ik.key);
+        }
       }
-    }
+    }  // shared_lock released
 
-    // Need to insert — allocate a new slot.
-    int32_t new_slot = static_cast<int32_t>(
-        num_entries_.fetch_add(1, std::memory_order_acq_rel));
-
-    // Exclusive (write) lock for insertion.
-    {
+    // ── Pass 2: exclusive (write) lock, insert new keys in batch
+    if (!pending_inserts.empty()) {
       std::unique_lock lock(buckets_[b].mtx);
-      // Double-check: another thread may have inserted this key between
-      // our shared_lock release and unique_lock acquisition.
-      int32_t* found = buckets_[b].find(key);
-      if (found) {
-        slot_indices[i] = *found;
-        batch_map[key] = *found;
-        num_entries_.fetch_sub(1, std::memory_order_acq_rel);  // undo slot allocation
-        continue;
-      }
+      for (int64_t key : pending_inserts) {
+        // Double-check (another thread may have inserted between passes)
+        int32_t* found = buckets_[b].find(key);
+        if (found) {
+          key_to_slot[key] = *found;
+          continue;
+        }
 
-      // Insert into bucket — auto-grow if full and retry.
-      while (!buckets_[b].insert(key, new_slot)) {
-        buckets_[b].grow();
+        int32_t new_slot = static_cast<int32_t>(
+            num_entries_.fetch_add(1, std::memory_order_acq_rel));
+
+        while (!buckets_[b].insert(key, new_slot)) {
+          buckets_[b].grow();
+        }
+        key_to_slot[key] = new_slot;
+        ++new_count;
       }
-      slot_indices[i] = new_slot;
-      batch_map[key] = new_slot;
     }
-    ++new_count;
+
+    // ── Backfill: write slot_indices for all original indices
+    for (const auto& ik : group) {
+      slot_indices[ik.idx] = key_to_slot[ik.key];
+    }
   }
 
   return new_count;

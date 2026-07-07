@@ -5,6 +5,10 @@
 #include <stdexcept>
 #include <algorithm>
 #include <utility>
+#include <unordered_map>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace hashemb {
 
@@ -67,12 +71,17 @@ void EmbeddingTable::lookup(const int32_t* slot_indices, float* output,
                             int64_t n) const {
   int32_t D = embedding_dim_;
   int64_t bs = block_size_;
+  const auto& blocks = emb_blocks_;  // thread-safe const ref
+
+#ifdef _OPENMP
+  #pragma omp parallel for schedule(static)
+#endif
   for (int64_t i = 0; i < n; ++i) {
     int32_t slot = slot_indices[i];
     if (slot < 0) {
       std::memset(output + i * D, 0, sizeof(float) * D);
     } else {
-      std::memcpy(output + i * D, slot_ptr(emb_blocks_, slot, D, bs),
+      std::memcpy(output + i * D, slot_ptr(blocks, slot, D, bs),
                   sizeof(float) * D);
     }
   }
@@ -108,34 +117,32 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
   }
   if (max_slot >= 0) ensure_slot(max_slot);
 
-  // Sort indices by slot to group duplicates.
-  auto* idx = new int64_t[n];
-  for (int64_t i = 0; i < n; ++i) idx[i] = i;
-  std::sort(idx, idx + n, [&](int64_t a, int64_t b) {
-    return slot_indices[a] < slot_indices[b];
-  });
+  // Collect unique valid slots (dedup).  Reserve a reasonable lower bound.
+  std::unordered_map<int32_t, bool> seen_slots;
+  seen_slots.reserve(static_cast<size_t>(std::min(n, static_cast<int64_t>(200000))));
 
-  int64_t i = 0;
-  while (i < n) {
-    int32_t slot = slot_indices[idx[i]];
-    if (slot < 0) { ++i; continue; }
-    int64_t j = i;
-    while (j < n && slot_indices[idx[j]] == slot) ++j;
+  // Direct accumulation into grad_blocks_ (no sort, no heap idx array).
+  // Each occurrence of the same slot is added into the same grad buffer,
+  // naturally implementing "scatter add".
+  for (int64_t i = 0; i < n; ++i) {
+    int32_t slot = slot_indices[i];
+    if (slot < 0) continue;
 
-    // Mark slot as dirty (first time this step cycle).
+    seen_slots[slot] = true;
+
+    float* grad_dst = slot_ptr(grad_blocks_, slot, D, block_size_);
+    const float* g = grads + i * D;
+    for (int32_t d = 0; d < D; ++d) grad_dst[d] += g[d];
+  }
+
+  // Mark dirty slots for step().
+  for (const auto& p : seen_slots) {
+    int32_t slot = p.first;
     if (!slot_dirty_[slot]) {
       slot_dirty_[slot] = true;
       dirty_slots_.push_back(slot);
     }
-
-    float* grad_dst = slot_ptr(grad_blocks_, slot, D, block_size_);
-    for (int64_t k = i; k < j; ++k) {
-      const float* g = grads + idx[k] * D;
-      for (int32_t d = 0; d < D; ++d) grad_dst[d] += g[d];
-    }
-    i = j;
   }
-  delete[] idx;
 }
 
 // ===========================================================================
@@ -162,15 +169,23 @@ void EmbeddingTable::step() {
 
   if (opt_cfg_.type == OptimizerConfig::SGD) {
     float lr = opt_cfg_.lr;
+    auto* slots = dirty_slots_.data();
+    auto& emb = emb_blocks_;
+    auto& grad = grad_blocks_;
+    auto& dirty_bit = slot_dirty_;
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (size_t di = 0; di < ndirty; ++di) {
-      int32_t slot = dirty_slots_[di];
-      float* w = slot_ptr(emb_blocks_, slot, D, bs);
-      float* g = slot_ptr(grad_blocks_, slot, D, bs);
+      int32_t slot = slots[di];
+      float* w = slot_ptr(emb, slot, D, bs);
+      float* g = slot_ptr(grad, slot, D, bs);
       for (int32_t d = 0; d < D; ++d) {
         w[d] -= lr * g[d];
         g[d] = 0.0f;
       }
-      slot_dirty_[slot] = false;
+      dirty_bit[slot] = false;
     }
   } else if (opt_cfg_.type == OptimizerConfig::ADAM) {
     ++t_;
@@ -181,23 +196,33 @@ void EmbeddingTable::step() {
     float bias_corr1 = 1.0f - std::pow(b1, static_cast<float>(t_));
     float bias_corr2 = 1.0f - std::pow(b2, static_cast<float>(t_));
 
+    auto* slots = dirty_slots_.data();
+    auto& emb = emb_blocks_;
+    auto& grad = grad_blocks_;
+    auto& m = m_blocks_;
+    auto& v = v_blocks_;
+    auto& dirty_bit = slot_dirty_;
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (size_t di = 0; di < ndirty; ++di) {
-      int32_t slot = dirty_slots_[di];
-      float* w = slot_ptr(emb_blocks_, slot, D, bs);
-      float* g = slot_ptr(grad_blocks_, slot, D, bs);
-      float* m = slot_ptr(m_blocks_, slot, D, bs);
-      float* v = slot_ptr(v_blocks_, slot, D, bs);
+      int32_t slot = slots[di];
+      float* w = slot_ptr(emb, slot, D, bs);
+      float* g = slot_ptr(grad, slot, D, bs);
+      float* mp = slot_ptr(m, slot, D, bs);
+      float* vp = slot_ptr(v, slot, D, bs);
 
       for (int32_t d = 0; d < D; ++d) {
         float gd = g[d];
-        m[d] = b1 * m[d] + (1.0f - b1) * gd;
-        v[d] = b2 * v[d] + (1.0f - b2) * gd * gd;
-        float m_hat = m[d] / bias_corr1;
-        float v_hat = v[d] / bias_corr2;
+        mp[d] = b1 * mp[d] + (1.0f - b1) * gd;
+        vp[d] = b2 * vp[d] + (1.0f - b2) * gd * gd;
+        float m_hat = mp[d] / bias_corr1;
+        float v_hat = vp[d] / bias_corr2;
         w[d] -= lr * m_hat / (std::sqrt(v_hat) + eps);
         g[d] = 0.0f;
       }
-      slot_dirty_[slot] = false;
+      dirty_bit[slot] = false;
     }
   }
 

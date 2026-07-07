@@ -157,10 +157,11 @@ class TestCppHashTable:
         """Save → load → continue training → verify consistency."""
         t1 = _hashemb_cpp.HashEmbeddingTable(100, 4, optimizer="sgd", lr=0.1)
         keys = np.array([10, 20], dtype=np.int64)
-        t1.lookup_and_gather(keys)
-        # Train one step.
+        slots1 = t1.find_or_create(keys)   # → [slot_10, slot_20] (order depends on impl)
+
+        # Train one step on the slots that were assigned.
         grads = np.ones((2, 4), dtype=np.float32) * 0.5
-        t1.scatter_add_grad(np.array([0, 1], dtype=np.int32), grads)
+        t1.scatter_add_grad(slots1, grads)
         t1.step()
 
         sd = t1.state_dict()
@@ -170,17 +171,19 @@ class TestCppHashTable:
         t2.load_state_dict(sd)
         assert t2.num_entries == 2
 
-        # Verify mappings (keys → same slots).
+        # Verify mappings: same keys → same slots as before (slot order is an
+        # implementation detail, only consistency matters).
         s2 = t2.find_or_create(np.array([10, 20], dtype=np.int64))
-        assert np.all(s2 == [0, 1])
+        assert np.all(s2 == slots1)
 
-        # Verify weights preserved.
+        # Verify weights preserved (lookup by slot, not key).
         w2 = t2.lookup(s2)
-        w1 = t1.lookup(np.array([0, 1], dtype=np.int32))
+        w1 = t1.lookup(slots1)
         assert np.allclose(w1, w2, atol=1e-6)
 
-        # Continue training.
-        t2.scatter_add_grad(np.array([0], dtype=np.int32),
+        # Continue training on the restored table (single slot update).
+        t2_slots = t2.find_or_create(np.array([10], dtype=np.int64))
+        t2.scatter_add_grad(t2_slots[0:1],
                             np.ones((1, 4), dtype=np.float32))
         t2.step()
 

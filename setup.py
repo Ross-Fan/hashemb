@@ -4,10 +4,12 @@ import sys
 
 # Determine compile flags
 extra_compile_args = []
+extra_link_args = []
 if sys.platform == "darwin":
     extra_compile_args += ["-std=c++17", "-O2", "-Wall"]
 else:
-    extra_compile_args += ["-std=c++17", "-O2", "-Wall", "-fopenmp"]
+    extra_compile_args += ["-std=c++17", "-O3", "-Wall", "-fopenmp"]
+    extra_link_args += ["-fopenmp"]
 
 ext_modules = [
     Extension(
@@ -22,6 +24,7 @@ ext_modules = [
         ],
         language="c++",
         extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
     ),
 ]
 
