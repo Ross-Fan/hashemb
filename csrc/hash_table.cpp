@@ -1,7 +1,8 @@
 #include "hash_table.h"
 #include <cstring>
-#include <stdexcept>
 #include <limits>
+#include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace hashemb {
