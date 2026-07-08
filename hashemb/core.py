@@ -78,7 +78,8 @@ class HashEmbedding(torch.nn.Module):
                  lr: float = 0.01,
                  beta1: float = 0.9, beta2: float = 0.999,
                  eps: float = 1e-8,
-                 block_size: int = 1_000_000):
+                 block_size: int = 1_000_000,
+                 initial_scale: float = 0.0):
         super().__init__()
         if embedding_dim < 1:
             raise ValueError("embedding_dim must be ≥ 1")
@@ -98,6 +99,7 @@ class HashEmbedding(torch.nn.Module):
             optimizer=optimizer, lr=lr,
             beta1=beta1, beta2=beta2, eps=eps,
             block_size=block_size,
+            initial_scale=initial_scale,
         )
 
         # Dummy parameter for autograd graph (see HashEmbeddingFunction).

@@ -70,7 +70,8 @@ class EmbeddingTable {
  public:
   EmbeddingTable(int64_t initial_capacity, int32_t embedding_dim,
                  const OptimizerConfig& opt_cfg = OptimizerConfig{},
-                 int64_t block_size = kDefaultBlockSize);
+                 int64_t block_size = kDefaultBlockSize,
+                 float initial_scale = 0.0f);
   ~EmbeddingTable();
 
   EmbeddingTable(const EmbeddingTable&) = delete;
@@ -148,6 +149,7 @@ class EmbeddingTable {
   int64_t initial_capacity_;
   int32_t embedding_dim_;
   int64_t block_size_;
+  float initial_scale_ = 0.0f;
   OptimizerConfig opt_cfg_;
 
   // Block-based storage (allocated on demand via ensure_slot)

@@ -114,8 +114,8 @@ class PureEmbeddingModel(torch.nn.Module):
 class HashBigModel(torch.nn.Module):
     def __init__(self, dim, capacity_per_field, lr):
         super().__init__()
-        self.user_emb = HashEmbedding(dim, capacity_per_field, optimizer="adam", lr=lr)
-        self.movie_emb = HashEmbedding(dim, capacity_per_field, optimizer="adam", lr=lr)
+        self.user_emb = HashEmbedding(dim, capacity_per_field, optimizer="adam", lr=lr, initial_scale=0.01)
+        self.movie_emb = HashEmbedding(dim, capacity_per_field, optimizer="adam", lr=lr, initial_scale=0.01)
         self.predict = torch.nn.Linear(dim * 2, 1)
         torch.nn.init.xavier_uniform_(self.predict.weight)
         torch.nn.init.zeros_(self.predict.bias)

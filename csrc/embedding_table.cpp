@@ -18,12 +18,14 @@ namespace hashemb {
 
 EmbeddingTable::EmbeddingTable(int64_t initial_capacity, int32_t embedding_dim,
                                const OptimizerConfig& opt_cfg,
-                               int64_t block_size)
+                               int64_t block_size,
+                               float initial_scale)
     : initial_capacity_(initial_capacity),
       embedding_dim_(embedding_dim),
       block_size_(block_size),
       opt_cfg_(opt_cfg),
-      hash_table_(initial_capacity) {
+      hash_table_(initial_capacity),
+      initial_scale_(initial_scale) {
   if (initial_capacity <= 0 || embedding_dim <= 0) {
     throw std::invalid_argument("capacity and embedding_dim must be positive");
   }
@@ -45,6 +47,7 @@ EmbeddingTable::~EmbeddingTable() {
 void EmbeddingTable::ensure_slot(int64_t slot_id) {
   int64_t needed = (slot_id / block_size_) + 1;
   while (static_cast<int64_t>(emb_blocks_.size()) < needed) {
+    int64_t block_id = static_cast<int64_t>(emb_blocks_.size());
     emb_blocks_.emplace_back();
     emb_blocks_.back().allocate(block_size_, embedding_dim_);
     grad_blocks_.emplace_back();
@@ -54,6 +57,19 @@ void EmbeddingTable::ensure_slot(int64_t slot_id) {
       m_blocks_.back().allocate(block_size_, embedding_dim_);
       v_blocks_.emplace_back();
       v_blocks_.back().allocate(block_size_, embedding_dim_);
+    }
+    // Randomly initialize embedding weights if initial_scale > 0.
+    // grad/m/v blocks are always zero-initialized.
+    if (initial_scale_ > 0.0f) {
+      int64_t n = block_size_ * embedding_dim_;
+      float* data = emb_blocks_.back().data;
+      // Simple LCG: different seed per block for de-correlation.
+      uint64_t state = 0x9d2c5680ULL + static_cast<uint64_t>(block_id) * 0x517cc1b7ULL;
+      for (int64_t i = 0; i < n; ++i) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        float r = static_cast<float>((state >> 32) & 0xFFFFFFFF) / 4294967296.0f;
+        data[i] = (r * 2.0f - 1.0f) * initial_scale_;
+      }
     }
   }
   // Grow slot_dirty_ to cover the new block's slots.
