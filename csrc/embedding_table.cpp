@@ -196,23 +196,22 @@ void EmbeddingTable::step() {
 
   if (opt_cfg_.type == OptimizerConfig::SGD) {
     float lr = opt_cfg_.lr;
-    auto* slots = dirty_slots_.data();
-    auto& emb = emb_blocks_;
-    auto& grad = grad_blocks_;
-    auto& dirty_bit = slot_dirty_;
+    const int32_t* slots = dirty_slots_.data();
 
 #ifdef HASHEMB_OMP_STEP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) \
+            default(none) \
+            shared(lr, slots, D, bs, ndirty, emb_blocks_, grad_blocks_, slot_dirty_)
 #endif
     for (size_t di = 0; di < ndirty; ++di) {
       int32_t slot = slots[di];
-      float* w = slot_ptr(emb, slot, D, bs);
-      float* g = slot_ptr(grad, slot, D, bs);
+      float* w = slot_ptr(emb_blocks_, slot, D, bs);
+      float* g = slot_ptr(grad_blocks_, slot, D, bs);
       for (int32_t d = 0; d < D; ++d) {
         w[d] -= lr * g[d];
         g[d] = 0.0f;
       }
-      dirty_bit[slot] = false;
+      slot_dirty_[slot] = false;
     }
   } else if (opt_cfg_.type == OptimizerConfig::ADAM) {
     ++t_;
@@ -223,22 +222,21 @@ void EmbeddingTable::step() {
     float bias_corr1 = 1.0f - std::pow(b1, static_cast<float>(t_));
     float bias_corr2 = 1.0f - std::pow(b2, static_cast<float>(t_));
 
-    auto* slots = dirty_slots_.data();
-    auto& emb = emb_blocks_;
-    auto& grad = grad_blocks_;
-    auto& m = m_blocks_;
-    auto& v = v_blocks_;
-    auto& dirty_bit = slot_dirty_;
+    const int32_t* slots = dirty_slots_.data();
 
 #ifdef HASHEMB_OMP_STEP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) \
+            default(none) \
+            shared(lr, b1, b2, eps, bias_corr1, bias_corr2, \
+                   slots, D, bs, ndirty, \
+                   emb_blocks_, grad_blocks_, m_blocks_, v_blocks_, slot_dirty_)
 #endif
     for (size_t di = 0; di < ndirty; ++di) {
       int32_t slot = slots[di];
-      float* w = slot_ptr(emb, slot, D, bs);
-      float* g = slot_ptr(grad, slot, D, bs);
-      float* mp = slot_ptr(m, slot, D, bs);
-      float* vp = slot_ptr(v, slot, D, bs);
+      float* w = slot_ptr(emb_blocks_, slot, D, bs);
+      float* g = slot_ptr(grad_blocks_, slot, D, bs);
+      float* mp = slot_ptr(m_blocks_, slot, D, bs);
+      float* vp = slot_ptr(v_blocks_, slot, D, bs);
 
       for (int32_t d = 0; d < D; ++d) {
         float gd = g[d];
@@ -249,7 +247,7 @@ void EmbeddingTable::step() {
         w[d] -= lr * m_hat / (std::sqrt(v_hat) + eps);
         g[d] = 0.0f;
       }
-      dirty_bit[slot] = false;
+      slot_dirty_[slot] = false;
     }
   }
 
