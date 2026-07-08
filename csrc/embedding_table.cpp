@@ -201,7 +201,7 @@ void EmbeddingTable::step() {
     auto& grad = grad_blocks_;
     auto& dirty_bit = slot_dirty_;
 
-#ifdef _OPENMP
+#ifdef HASHEMB_OMP_STEP
     #pragma omp parallel for schedule(static)
 #endif
     for (size_t di = 0; di < ndirty; ++di) {
@@ -230,7 +230,7 @@ void EmbeddingTable::step() {
     auto& v = v_blocks_;
     auto& dirty_bit = slot_dirty_;
 
-#ifdef _OPENMP
+#ifdef HASHEMB_OMP_STEP
     #pragma omp parallel for schedule(static)
 #endif
     for (size_t di = 0; di < ndirty; ++di) {
