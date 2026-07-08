@@ -7,9 +7,20 @@ Architecture (NFM-style, single linear layer after embedding concat):
                      ├─ concat → Linear(2*D, 1) → logit
     MovieID → embed ─┘
 
-Single linear层确保dense部分无法"补偿"embedding不更新——embedding直接决定预测质量。
-对比 AUC 以验证 HashEmb 在真实数据上效果等价于 nn.Embedding。
+Data: MovieLens 1M (ratings.dat), label = rating >= 4.
+
+Download:
+    # Download ml-1m.zip from https://grouplens.org/datasets/movielens/1m/
+    # or use wget:
+    wget https://files.grouplens.org/datasets/movielens/ml-1m.zip
+    unzip ml-1m.zip
+
+Usage:
+    python examples/compare_ml1m.py
+    # or specify data path:
+    python examples/compare_ml1m.py --data /path/to/ml-1m/ratings.dat
 """
+import argparse
 import os
 import sys
 import time
@@ -18,8 +29,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import roc_auc_score
 
-# Add project root to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hashemb import HashEmbedding
 
 # ===========================================================================
@@ -27,14 +36,13 @@ from hashemb import HashEmbedding
 # ===========================================================================
 EMBEDDING_DIM = 16
 BATCH_SIZE = 1024
-EPOCHS = 20
+EPOCHS = 10
 LR = 0.01
 SEED = 42
 
-DATA_PATH = "/Users/rexus/works/hkv_pproject/ml-1m/ratings.dat"
-N_USERS = 6040   # UserID 1..6040
-N_MOVIES = 3952  # MovieID 1..3952
-DEVICE = "cpu"
+# ML-1M dataset constants
+N_USERS = 6040
+N_MOVIES = 3952
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -44,7 +52,7 @@ np.random.seed(SEED)
 # Data loading
 # ===========================================================================
 class ML1M_Dataset(Dataset):
-    """Load ratings.dat, binary label: rating >= 4 → 1."""
+    """Load ratings.dat, binary label: rating >= 4 -> 1."""
     def __init__(self, path, train=True, split=0.8, seed=SEED):
         data = []
         with open(path) as f:
@@ -67,25 +75,20 @@ class ML1M_Dataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return {
-            "user_id": self.users[idx],
-            "movie_id": self.movies[idx],
-            "label": self.labels[idx],
-        }
+        return self.users[idx], self.movies[idx], self.labels[idx]
 
 
 def collate_fn(batch):
-    users = torch.tensor([b["user_id"] for b in batch], dtype=torch.int64)
-    movies = torch.tensor([b["movie_id"] for b in batch], dtype=torch.int64)
-    labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
-    return {"user_id": users, "movie_id": movies, "label": labels}
+    users = torch.tensor([b[0] for b in batch], dtype=torch.int64)
+    movies = torch.tensor([b[1] for b in batch], dtype=torch.int64)
+    labels = torch.tensor([b[2] for b in batch], dtype=torch.float32)
+    return users, movies, labels
 
 
 # ===========================================================================
 # Pure PyTorch baseline
 # ===========================================================================
 class PureEmbeddingModel(torch.nn.Module):
-    """Standard nn.Embedding baseline."""
     def __init__(self, n_users, n_movies, embedding_dim):
         super().__init__()
         self.user_emb = torch.nn.Embedding(n_users + 1, embedding_dim, padding_idx=0)
@@ -94,109 +97,53 @@ class PureEmbeddingModel(torch.nn.Module):
         torch.nn.init.normal_(self.movie_emb.weight, mean=0, std=0.01)
         self.user_emb.weight.data[0] = 0
         self.movie_emb.weight.data[0] = 0
-
-        # Single linear layer (NFM-style: concat → 1 layer)
         total_dim = 2 * embedding_dim
         self.predict = torch.nn.Linear(total_dim, 1)
-
-        # Init linear layer
         torch.nn.init.xavier_uniform_(self.predict.weight)
         torch.nn.init.zeros_(self.predict.bias)
 
-    def forward(self, feat_dict):
-        u = self.user_emb(feat_dict["user_id"])
-        m = self.movie_emb(feat_dict["movie_id"])
-        h = torch.cat([u, m], dim=-1)
-        return self.predict(h).squeeze(-1)
+    def forward(self, uid, mid):
+        u = self.user_emb(uid)
+        m = self.movie_emb(mid)
+        return self.predict(torch.cat([u, m], dim=-1)).squeeze(-1)
 
 
 # ===========================================================================
-# HashEmb BigModel (two-sub-model)
+# HashEmb BigModel
 # ===========================================================================
-class FeatureEmbedder(torch.nn.Module):
-    """SubModel 1: feat_id dict → feat embedding dict.
-
-    Each feature field gets its own HashEmbedding table (per-field tables,
-    since feature ID spaces may overlap — e.g. user_id and movie_id).
-    """
-    def __init__(self, feature_names, embedding_dim, capacity_per_field,
-                 optimizer="adam", lr=0.001):
+class HashBigModel(torch.nn.Module):
+    def __init__(self, dim, capacity_per_field, lr):
         super().__init__()
-        self.feature_names = list(feature_names)
-        # Per-field HashEmbedding tables
-        for name in feature_names:
-            self.__setattr__(f"emb_{name}", HashEmbedding(
-                embedding_dim=embedding_dim,
-                capacity=capacity_per_field,
-                optimizer=optimizer,
-                lr=lr,
-            ))
+        self.user_emb = HashEmbedding(dim, capacity_per_field, optimizer="adam", lr=lr)
+        self.movie_emb = HashEmbedding(dim, capacity_per_field, optimizer="adam", lr=lr)
+        self.predict = torch.nn.Linear(dim * 2, 1)
+        torch.nn.init.xavier_uniform_(self.predict.weight)
+        torch.nn.init.zeros_(self.predict.bias)
 
-    def forward(self, feat_dict):
-        return {name: self.__getattr__(f"emb_{name}")(feat_dict[name])
-                for name in self.feature_names}
+    def forward(self, uid, mid):
+        u = self.user_emb(uid)
+        m = self.movie_emb(mid)
+        return self.predict(torch.cat([u, m], dim=-1)).squeeze(-1)
 
     def step(self):
-        for name in self.feature_names:
-            self.__getattr__(f"emb_{name}").step()
-
-
-class DenseModel(torch.nn.Module):
-    """SubModel 2: embedding dict → logits. Single linear layer."""
-    def __init__(self, feature_names, embedding_dim):
-        super().__init__()
-        self.feature_names = list(feature_names)
-        total_dim = len(feature_names) * embedding_dim
-        self.predict = torch.nn.Linear(total_dim, 1)
-        torch.nn.init.xavier_uniform_(self.predict.weight)
-        torch.nn.init.zeros_(self.predict.bias)
-
-    def forward(self, emb_dict):
-        combined = torch.cat(
-            [emb_dict[name] for name in self.feature_names], dim=-1)
-        return self.predict(combined).squeeze(-1)
-
-
-def init_hash_emb_like_pure(embedder, field_name, n_ids, mean=0, std=0.01):
-    """Initialize a single field's HashEmbedding to match PureEmbeddingModel init."""
-    emb = embedder.__getattr__(f"emb_{field_name}")
-    feat_ids = torch.arange(1, n_ids + 1, dtype=torch.int64)
-    _ = emb(feat_ids)  # create entries
-    sd = emb.state_dict()
-    rng = np.random.RandomState(SEED)
-    D = sd['weight'].shape[1]
-    raw = rng.randn(len(sd['keys']), D).astype(np.float32) * std + mean
-    sd['weight'] = torch.from_numpy(raw)
-    sd['grad'] = torch.zeros_like(sd['grad'])
-    if 'm' in sd and sd['m'].numel() > 0:
-        sd['m'] = torch.zeros_like(sd['m'])
-    if 'v' in sd and sd['v'].numel() > 0:
-        sd['v'] = torch.zeros_like(sd['v'])
-    emb.load_state_dict(sd)
+        self.user_emb.step()
+        self.movie_emb.step()
 
 
 # ===========================================================================
 # Training & evaluation
 # ===========================================================================
-def train_epoch(model, loader, optimizer, is_hash_model=False):
+def train_epoch(model, loader, optimizer, is_hash):
     model.train()
-    total_loss = 0.0
-    n_batches = 0
-    for batch in loader:
-        feat_dict = {
-            "user_id": batch["user_id"],
-            "movie_id": batch["movie_id"],
-        }
-        labels = batch["label"]
-
+    total_loss, n_batches = 0.0, 0
+    for users, movies, labels in loader:
         optimizer.zero_grad()
-        logits = model(feat_dict)
+        logits = model(users, movies)
         loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels)
         loss.backward()
         optimizer.step()
-        if is_hash_model:
-            model.embedder.step()
-
+        if is_hash:
+            model.step()
         total_loss += loss.item()
         n_batches += 1
     return total_loss / n_batches
@@ -205,139 +152,135 @@ def train_epoch(model, loader, optimizer, is_hash_model=False):
 @torch.no_grad()
 def evaluate(model, loader):
     model.eval()
-    all_scores = []
-    all_labels = []
-    for batch in loader:
-        feat_dict = {
-            "user_id": batch["user_id"],
-            "movie_id": batch["movie_id"],
-        }
-        logits = model(feat_dict)
-        scores = torch.sigmoid(logits)
-        all_scores.append(scores.cpu().numpy())
-        all_labels.append(batch["label"].cpu().numpy())
-    y_score = np.concatenate(all_scores)
-    y_true = np.concatenate(all_labels)
-    return roc_auc_score(y_true, y_score)
+    all_scores, all_labels = [], []
+    for users, movies, labels in loader:
+        logits = model(users, movies)
+        all_scores.append(torch.sigmoid(logits).numpy())
+        all_labels.append(labels.numpy())
+    return roc_auc_score(np.concatenate(all_labels), np.concatenate(all_scores))
 
 
 # ===========================================================================
 # Main
 # ===========================================================================
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", default="", help="Path to ratings.dat")
+    args = parser.parse_args()
+
+    # Try common locations for ratings.dat
+    candidates = [args.data] if args.data else []
+    candidates += [
+        "ml-1m/ratings.dat",
+        os.path.expanduser("~/ml-1m/ratings.dat"),
+        os.path.expanduser("~/data/ml-1m/ratings.dat"),
+        "/tmp/ml-1m/ratings.dat",
+    ]
+    data_path = None
+    for p in candidates:
+        if p and os.path.isfile(p):
+            data_path = p
+            break
+
+    if not data_path:
+        print("ERROR: ratings.dat not found. Download it:")
+        print("  wget https://files.grouplens.org/datasets/movielens/ml-1m.zip")
+        print("  unzip ml-1m.zip")
+        print("Then run: python examples/compare_ml1m.py --data ml-1m/ratings.dat")
+        sys.exit(1)
+
     print("=" * 60)
-    print("ML-1M: nn.Embedding vs HashEmb BigModel")
+    print("ML-1M: nn.Embedding vs HashEmb")
     print("=" * 60)
-    print(f"  embedding_dim={EMBEDDING_DIM}, batch_size={BATCH_SIZE}, "
-          f"epochs={EPOCHS}, lr={LR}")
-    print(f"  Users: {N_USERS}, Movies: {N_MOVIES}")
-    print(f"  Architecture: concat → Linear({2*EMBEDDING_DIM}, 1) → sigmoid")
+    print(f"  Data: {data_path}")
+    print(f"  dim={EMBEDDING_DIM}, batch={BATCH_SIZE}, epochs={EPOCHS}, lr={LR}")
     print()
 
-    # ── Load data ──────────────────────────────────────────────────────
-    print("Loading data...")
-    train_dataset = ML1M_Dataset(DATA_PATH, train=True)
-    val_dataset = ML1M_Dataset(DATA_PATH, train=False)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE,
-                              shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE,
-                            shuffle=False, collate_fn=collate_fn)
-    print(f"  Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    # ── Load data ──
+    train_ds = ML1M_Dataset(data_path, train=True)
+    val_ds = ML1M_Dataset(data_path, train=False)
+    train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+    print(f"Train label balance: {(sum(train_ds.labels)):.0f}/{len(train_ds)}")
     print()
 
-    # ── Pure PyTorch baseline ──────────────────────────────────────────
+    # ── Pure PyTorch ──
     print("=" * 60)
-    print("Model 1: Pure PyTorch nn.Embedding")
+    print("nn.Embedding baseline")
     print("=" * 60)
+    torch.manual_seed(SEED)
     pure_model = PureEmbeddingModel(N_USERS, N_MOVIES, EMBEDDING_DIM)
     pure_opt = torch.optim.Adam(pure_model.parameters(), lr=LR)
 
-    pure_aucs = []
-    pure_times = []
+    pure_aucs, pure_times = [], []
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
-        loss = train_epoch(pure_model, train_loader, pure_opt, is_hash_model=False)
+        loss = train_epoch(pure_model, train_loader, pure_opt, is_hash=False)
         auc = evaluate(pure_model, val_loader)
         elapsed = time.time() - t0
         pure_aucs.append(auc)
         pure_times.append(elapsed)
-        print(f"  Epoch {epoch:2d}: loss={loss:.4f}, val_auc={auc:.4f} "
-              f"({elapsed:.1f}s)")
-    print(f"  → Best val AUC: {max(pure_aucs):.4f}")
+        print(f"  Ep {epoch:2d}: loss={loss:.4f}  val_auc={auc:.4f}  ({elapsed:.1f}s)")
+
+    print(f"  Best AUC: {max(pure_aucs):.4f}")
     print()
 
-    # ── HashEmb BigModel ───────────────────────────────────────────────
+    # ── HashEmb ──
     print("=" * 60)
-    print("Model 2: HashEmb BigModel")
+    print("HashEmb")
     print("=" * 60)
-    FEATURE_NAMES = ["user_id", "movie_id"]
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
-    hash_embedder = FeatureEmbedder(
-        FEATURE_NAMES, EMBEDDING_DIM, capacity_per_field=10000,
-        optimizer="adam", lr=LR,
+    hash_model = HashBigModel(
+        dim=EMBEDDING_DIM,
+        capacity_per_field=10000,
+        lr=LR,
     )
-    hash_dense = DenseModel(FEATURE_NAMES, EMBEDDING_DIM)
+    hash_opt = torch.optim.Adam(hash_model.predict.parameters(), lr=LR)
 
-    # Initialize each field's HashEmbedding to match PureEmbeddingModel
-    init_hash_emb_like_pure(hash_embedder, "user_id", N_USERS, mean=0, std=0.01)
-    init_hash_emb_like_pure(hash_embedder, "movie_id", N_MOVIES, mean=0, std=0.01)
-
-    hash_opt = torch.optim.Adam(hash_dense.parameters(), lr=LR)
-
-    class HashBigModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embedder = hash_embedder
-            self.dense = hash_dense
-
-        def forward(self, feat_dict):
-            return self.dense(self.embedder(feat_dict))
-
-    hash_model = HashBigModel()
-
-    hash_aucs = []
-    hash_times = []
+    hash_aucs, hash_times = [], []
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
-        loss = train_epoch(hash_model, train_loader, hash_opt, is_hash_model=True)
+        loss = train_epoch(hash_model, train_loader, hash_opt, is_hash=True)
         auc = evaluate(hash_model, val_loader)
         elapsed = time.time() - t0
         hash_aucs.append(auc)
         hash_times.append(elapsed)
-        print(f"  Epoch {epoch:2d}: loss={loss:.4f}, val_auc={auc:.4f} "
-              f"({elapsed:.1f}s)")
-    print(f"  → Best val AUC: {max(hash_aucs):.4f}")
+        print(f"  Ep {epoch:2d}: loss={loss:.4f}  val_auc={auc:.4f}  ({elapsed:.1f}s)")
+
+    print(f"  Best AUC: {max(hash_aucs):.4f}")
     print()
 
-    # ── Comparison summary ─────────────────────────────────────────────
+    # ── Comparison ──
     print("=" * 60)
-    print("Comparison Summary")
+    print("Comparison")
     print("=" * 60)
-    print(f"  {'Epoch':>5s} | {'Pure AUC':>8s} {'Hash AUC':>8s} {'ΔAUC':>8s}")
-    print(f"  {'─'*5}-|-{'─'*8}-{'─'*8}-{'─'*8}")
-    for epoch in range(EPOCHS):
-        delta = pure_aucs[epoch] - hash_aucs[epoch]
-        marker = " ★" if epoch == np.argmax(pure_aucs) else "  "
-        marker2 = " ★" if epoch == np.argmax(hash_aucs) else "  "
-        print(f"  {epoch+1:5d} | {pure_aucs[epoch]:.4f}{marker} "
-              f"{hash_aucs[epoch]:.4f}{marker2} {delta:+.4f}")
+    print(f"{'Ep':>3s} | {'Pure':>8s}  {'Hash':>8s} | {'ΔAUC':>8s}")
+    print("-" * 38)
 
-    best_pure = max(pure_aucs)
-    best_hash = max(hash_aucs)
-    print(f"  {'─'*5}-|-{'─'*8}-{'─'*8}-{'─'*8}")
-    print(f"  {'Best':>5s} | {best_pure:.4f}   {best_hash:.4f}   "
-          f"{best_pure - best_hash:+.4f}")
+    for ep in range(EPOCHS):
+        d = pure_aucs[ep] - hash_aucs[ep]
+        pm = "★" if pure_aucs[ep] == max(pure_aucs) else " "
+        hm = "★" if hash_aucs[ep] == max(hash_aucs) else " "
+        print(f"{ep+1:3d} | {pure_aucs[ep]:.4f}{pm} {hash_aucs[ep]:.4f}{hm} | {d:+.4f}")
+
+    print(f"Best | {max(pure_aucs):.4f}   {max(hash_aucs):.4f}   "
+          f"{max(pure_aucs)-max(hash_aucs):+.4f}")
 
     print()
-    if abs(best_pure - best_hash) < 0.01:
-        print("  ✓ HashEmb AUC matches nn.Embedding within 0.01")
+    avg_pure = np.mean(pure_times)
+    avg_hash = np.mean(hash_times)
+    print(f"Avg epoch: Pure={avg_pure:.2f}s  HashEmb={avg_hash:.2f}s")
+    print(f"Speed:     Pure={avg_hash/avg_pure:.2f}x slower" if avg_hash > avg_pure
+          else f"Speed:     HashEmb={avg_pure/avg_hash:.2f}x faster")
+
+    if abs(max(pure_aucs) - max(hash_aucs)) < 0.01:
+        print("✓ HashEmb AUC matches nn.Embedding (Δ < 0.01)")
     else:
-        print(f"  ⚠ AUC diff = {best_pure - best_hash:.4f}")
-
-    avg_time_pure = np.mean(pure_times)
-    avg_time_hash = np.mean(hash_times)
-    print(f"\n  Avg epoch time: Pure={avg_time_pure:.2f}s, "
-          f"HashEmb={avg_time_hash:.2f}s")
+        print(f"⚠ AUC diff = {max(pure_aucs)-max(hash_aucs):.4f} (> 0.01)")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
