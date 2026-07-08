@@ -59,16 +59,27 @@ void EmbeddingTable::ensure_slot(int64_t slot_id) {
       v_blocks_.back().allocate(block_size_, embedding_dim_);
     }
     // Randomly initialize embedding weights if initial_scale > 0.
+    // Uses Box-Muller transform to produce normal(0, initial_scale)
+    // distribution, matching nn.init.normal_(std=initial_scale).
     // grad/m/v blocks are always zero-initialized.
     if (initial_scale_ > 0.0f) {
       int64_t n = block_size_ * embedding_dim_;
       float* data = emb_blocks_.back().data;
       // Simple LCG: different seed per block for de-correlation.
       uint64_t state = 0x9d2c5680ULL + static_cast<uint64_t>(block_id) * 0x517cc1b7ULL;
-      for (int64_t i = 0; i < n; ++i) {
+      constexpr float kPi = 3.141592653589793f;
+      for (int64_t i = 0; i < n; i += 2) {
         state = state * 6364136223846793005ULL + 1442695040888963407ULL;
-        float r = static_cast<float>((state >> 32) & 0xFFFFFFFF) / 4294967296.0f;
-        data[i] = (r * 2.0f - 1.0f) * initial_scale_;
+        float u1 = static_cast<float>((state >> 32) & 0xFFFFFFFF) / 4294967296.0f;
+        if (u1 < 1e-10f) u1 = 1e-10f;  // guard against log(0)
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        float u2 = static_cast<float>((state >> 32) & 0xFFFFFFFF) / 4294967296.0f;
+        // Box-Muller: two uniforms → two independent normal(0,1)
+        float r = std::sqrt(-2.0f * std::log(u1));
+        data[i] = r * std::cos(kPi * 2.0f * u2) * initial_scale_;
+        if (i + 1 < n) {
+          data[i + 1] = r * std::sin(kPi * 2.0f * u2) * initial_scale_;
+        }
       }
     }
   }
