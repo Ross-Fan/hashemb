@@ -1,8 +1,8 @@
 from setuptools import setup, Extension
 import pybind11
 
-extra_compile_args = ["-std=c++17", "-O2", "-Wall", "-fopenmp", "-DHASHEMB_OMP_STEP"]
-extra_link_args = ["-fopenmp"]
+extra_compile_args = ["-std=c++17", "-O2", "-Wall"]
+extra_link_args = []
 
 ext_modules = [
     Extension(

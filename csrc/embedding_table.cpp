@@ -6,11 +6,41 @@
 #include <algorithm>
 #include <utility>
 #include <unordered_map>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
+#include <thread>
+#include <vector>
 
 namespace hashemb {
+
+namespace {
+
+/// Simple parallel-for using std::thread.
+/// Falls back to sequential execution when work is too small.
+template <typename Func>
+void parallel_for(size_t n, Func&& fn) {
+  int nt = static_cast<int>(std::thread::hardware_concurrency());
+  // Only spawn threads when there's enough work (> 4 iterations per thread).
+  if (nt <= 1 || n < static_cast<size_t>(nt * 4)) {
+    for (size_t i = 0; i < n; ++i) fn(i);
+    return;
+  }
+  size_t chunk = n / nt;
+  size_t rem = n % nt;
+  std::vector<std::thread> workers;
+  workers.reserve(nt - 1);
+  size_t start = 0;
+  for (int t = 0; t < nt - 1; ++t) {
+    size_t end = start + chunk + (t < static_cast<int>(rem) ? 1 : 0);
+    workers.emplace_back([start, end, &fn]() {
+      for (size_t i = start; i < end; ++i) fn(i);
+    });
+    start = end;
+  }
+  // Last chunk on caller thread.
+  for (size_t i = start; i < n; ++i) fn(i);
+  for (auto& w : workers) w.join();
+}
+
+}  // namespace
 
 // ===========================================================================
 // Construction / destruction
@@ -98,20 +128,16 @@ void EmbeddingTable::lookup(const int32_t* slot_indices, float* output,
                             int64_t n) const {
   int32_t D = embedding_dim_;
   int64_t bs = block_size_;
-  const auto& blocks = emb_blocks_;  // thread-safe const ref
 
-#ifdef _OPENMP
-  #pragma omp parallel for schedule(static)
-#endif
-  for (int64_t i = 0; i < n; ++i) {
+  parallel_for(static_cast<size_t>(n), [&](size_t i) {
     int32_t slot = slot_indices[i];
     if (slot < 0) {
-      std::memset(output + i * D, 0, sizeof(float) * D);
+      std::memset(output + i * static_cast<int64_t>(D), 0, sizeof(float) * static_cast<size_t>(D));
     } else {
-      std::memcpy(output + i * D, slot_ptr(blocks, slot, D, bs),
-                  sizeof(float) * D);
+      std::memcpy(output + i * static_cast<int64_t>(D), slot_ptr(emb_blocks_, slot, D, bs),
+                  sizeof(float) * static_cast<size_t>(D));
     }
-  }
+  });
 }
 
 void EmbeddingTable::lookup_and_gather(const int64_t* keys, float* output,
@@ -198,12 +224,7 @@ void EmbeddingTable::step() {
     float lr = opt_cfg_.lr;
     const int32_t* slots = dirty_slots_.data();
 
-#ifdef HASHEMB_OMP_STEP
-    #pragma omp parallel for schedule(static) \
-            default(none) \
-            shared(lr, slots, D, bs, ndirty, emb_blocks_, grad_blocks_, slot_dirty_)
-#endif
-    for (size_t di = 0; di < ndirty; ++di) {
+    parallel_for(ndirty, [&](size_t di) {
       int32_t slot = slots[di];
       float* w = slot_ptr(emb_blocks_, slot, D, bs);
       float* g = slot_ptr(grad_blocks_, slot, D, bs);
@@ -212,7 +233,7 @@ void EmbeddingTable::step() {
         g[d] = 0.0f;
       }
       slot_dirty_[slot] = false;
-    }
+    });
   } else if (opt_cfg_.type == OptimizerConfig::ADAM) {
     ++t_;
     float lr = opt_cfg_.lr;
@@ -224,14 +245,7 @@ void EmbeddingTable::step() {
 
     const int32_t* slots = dirty_slots_.data();
 
-#ifdef HASHEMB_OMP_STEP
-    #pragma omp parallel for schedule(static) \
-            default(none) \
-            shared(lr, b1, b2, eps, bias_corr1, bias_corr2, \
-                   slots, D, bs, ndirty, \
-                   emb_blocks_, grad_blocks_, m_blocks_, v_blocks_, slot_dirty_)
-#endif
-    for (size_t di = 0; di < ndirty; ++di) {
+    parallel_for(ndirty, [&](size_t di) {
       int32_t slot = slots[di];
       float* w = slot_ptr(emb_blocks_, slot, D, bs);
       float* g = slot_ptr(grad_blocks_, slot, D, bs);
@@ -248,7 +262,7 @@ void EmbeddingTable::step() {
         g[d] = 0.0f;
       }
       slot_dirty_[slot] = false;
-    }
+    });
   }
 
   dirty_slots_.clear();
