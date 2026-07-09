@@ -97,6 +97,201 @@ PAD_VALUE = -1  # sentinel for seq padding in PyTorch tensors
 
 
 # =============================================================================
+# Shared TFRecord parsing (used by both pre-load and streaming paths)
+# =============================================================================
+def parse_single_tfrecord(example_proto):
+    """Parse a single TFRecord example protobuf into (feat_ids, label) tensors.
+
+    Mirrors the training pipeline's parse_tfrecord().
+    Returns (all_ids, click) where all_ids is (MAX_FEATS,) int64.
+    """
+    feat_spec = {
+        "click":      tf.io.FixedLenFeature([], tf.int64),
+        "play_score": tf.io.FixedLenFeature([], tf.float32),
+    }
+    for k in DISCRETE_KEYS:
+        feat_spec[k] = tf.io.FixedLenFeature([], tf.int64)
+    for k in ALL_SEQ_KEYS:
+        feat_spec[k] = tf.io.VarLenFeature(tf.int64)
+
+    parsed = tf.io.parse_single_example(example_proto, feat_spec)
+
+    # Discrete features → stack into 1D tensor
+    disc = tf.stack([parsed[k] for k in DISCRETE_KEYS])  # (63,)
+
+    # Sequence features → dense pad, flatten
+    seqs = []
+    for k, max_len in ALL_SEQ_KEYS.items():
+        dense = tf.sparse.to_dense(parsed[k], default_value=PAD_VALUE)
+        cur_len = tf.shape(dense)[0]
+        if cur_len < max_len:
+            dense = tf.pad(dense, [[0, max_len - cur_len]], constant_values=PAD_VALUE)
+        else:
+            dense = dense[:max_len]
+        seqs.append(dense)
+
+    # Concatenate all feature IDs: discrete + seq1 + seq2
+    all_ids = tf.concat([disc] + seqs, axis=0)  # (MAX_FEATS,)
+
+    # Label: click adjusted by play_score threshold
+    click = tf.where(
+        parsed["play_score"] > 0.1,
+        tf.ones_like(parsed["click"]),
+        parsed["click"],
+    )
+
+    return all_ids, click
+
+
+# =============================================================================
+# Streaming TFRecord Dataset (IterableDataset for large data)
+# =============================================================================
+class StreamingTFRecordDataset(torch.utils.data.IterableDataset):
+    """Lazy IterableDataset that streams TFRecord files from disk.
+
+    Designed for datasets too large to fit in memory (e.g. 100M+ records).
+    Builds a fresh tf.data pipeline inside __iter__() for fork safety.
+
+    Train/val split is at the file level: the first ``val_split`` fraction
+    of sorted files is reserved for validation.
+    """
+
+    def __init__(self, file_patterns, max_records=0, split="train",
+                 val_split=0.1, seed=42, shuffle_buffer_size=10000):
+        if split not in ("train", "val"):
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+
+        files = []
+        for pattern in file_patterns:
+            matched = tf.io.gfile.glob(pattern)
+            files.extend(matched)
+        if not files:
+            raise FileNotFoundError(
+                f"No TFRecord files found for patterns: {file_patterns}")
+        files.sort()
+
+        # File-level train/val split
+        n_val_files = max(1, int(len(files) * val_split))
+        if n_val_files >= len(files):
+            n_val_files = max(1, len(files) - 1)  # ensure at least 1 train file
+        if split == "train":
+            self._files = files[n_val_files:]
+        else:
+            self._files = files[:n_val_files]
+
+        self._max_records = max_records
+        self._seed = seed
+        self._shuffle_buffer_size = shuffle_buffer_size
+        self._epoch = 0
+        self.n_files = len(self._files)
+
+    def set_epoch(self, epoch):
+        """Set current epoch (controls shuffle seed). Call before each epoch."""
+        self._epoch = epoch
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+
+        if worker_info is None:
+            my_files = list(self._files)
+        else:
+            my_files = self._files[worker_info.id::worker_info.num_workers]
+
+        if not my_files:
+            return iter([])
+
+        # Shuffle file order for this epoch
+        rng = np.random.RandomState(self._seed + self._epoch)
+        rng.shuffle(my_files)
+
+        # Build tf.data pipeline (fresh each __iter__, fork-safe)
+        ds = tf.data.TFRecordDataset(my_files, compression_type="GZIP")
+        ds = ds.map(parse_single_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
+
+        if self._shuffle_buffer_size > 0:
+            ds = ds.shuffle(self._shuffle_buffer_size,
+                            seed=self._seed + self._epoch)
+
+        if self._max_records > 0:
+            ds = ds.take(self._max_records)
+
+        for ids_tf, lbl_tf in ds:
+            ids_np = ids_tf.numpy().astype(np.int64)
+            lbl_np = lbl_tf.numpy().astype(np.float32)
+
+            # Discard all-pad samples (same as pre-load path)
+            if not (ids_np != PAD_VALUE).any():
+                continue
+
+            yield (torch.from_numpy(ids_np).long(),
+                   torch.tensor(float(lbl_np), dtype=torch.float32))
+
+
+# =============================================================================
+# Stats estimation for streaming mode
+# =============================================================================
+def estimate_streaming_stats(file_patterns, n_samples=10000):
+    """Estimate dataset statistics from the first N records.
+
+    Provides approximate stats without loading the full dataset.
+    Returns None if n_samples <= 0.
+    """
+    if n_samples <= 0:
+        return None
+
+    files = []
+    for pattern in file_patterns:
+        matched = tf.io.gfile.glob(pattern)
+        files.extend(matched)
+    if not files:
+        return None
+    files.sort()
+
+    ds = (tf.data.TFRecordDataset(files, compression_type="GZIP")
+          .map(parse_single_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
+          .take(n_samples))
+
+    total_valid = 0
+    valid_counts = []
+    feat_min = float("inf")
+    feat_max = float("-inf")
+    n_pos = 0
+    count = 0
+    t0 = time.time()
+
+    for ids_tf, lbl_tf in ds:
+        ids_np = ids_tf.numpy()
+        lbl_np = lbl_tf.numpy()
+
+        valid = ids_np[ids_np != PAD_VALUE]
+        n_valid = len(valid)
+        if n_valid == 0:
+            continue
+
+        total_valid += n_valid
+        valid_counts.append(n_valid)
+        feat_min = min(feat_min, valid.min())
+        feat_max = max(feat_max, valid.max())
+        n_pos += int(lbl_np > 0.5)
+        count += 1
+
+    t1 = time.time()
+
+    if count == 0:
+        return None
+
+    return {
+        "n_valid_feats_mean": total_valid / count,
+        "n_valid_feats_std": float(np.std(valid_counts)),
+        "feat_id_min": int(feat_min),
+        "feat_id_max": int(feat_max),
+        "label_pos_ratio": n_pos / count,
+        "n_samples_est": count,
+        "est_time_s": t1 - t0,
+    }
+
+
+# =============================================================================
 # TFRecord → numpy arrays (pre-loaded for fast PyTorch iteration)
 # =============================================================================
 def load_tfrecord_data(file_patterns, max_records):
@@ -128,49 +323,7 @@ def load_tfrecord_data(file_patterns, max_records):
 
     # ── Build tf.data pipeline ──
     raw_ds = tf.data.TFRecordDataset(files, compression_type="GZIP")
-
-    def parse_single(example_proto):
-        """Mirrors the user's parse_tfrecord() — single example version."""
-        feat_spec = {
-            "click":      tf.io.FixedLenFeature([], tf.int64),
-            "play_score": tf.io.FixedLenFeature([], tf.float32),
-        }
-        for k in DISCRETE_KEYS:
-            feat_spec[k] = tf.io.FixedLenFeature([], tf.int64)
-        for k in ALL_SEQ_KEYS:
-            feat_spec[k] = tf.io.VarLenFeature(tf.int64)
-
-        parsed = tf.io.parse_single_example(example_proto, feat_spec)
-
-        # Discrete features → stack into 1D tensor
-        disc = tf.stack([parsed[k] for k in DISCRETE_KEYS])  # (63,)
-
-        # Sequence features → dense pad, flatten
-        seqs = []
-        for k, max_len in ALL_SEQ_KEYS.items():
-            dense = tf.sparse.to_dense(parsed[k], default_value=PAD_VALUE)
-            # Pad or truncate to max_len
-            cur_len = tf.shape(dense)[0]
-            if cur_len < max_len:
-                pad_amt = max_len - cur_len
-                dense = tf.pad(dense, [[0, pad_amt]], constant_values=PAD_VALUE)
-            else:
-                dense = dense[:max_len]
-            seqs.append(dense)
-
-        # Concatenate all feature IDs: discrete + seq1 + seq2
-        all_ids = tf.concat([disc] + seqs, axis=0)  # (MAX_FEATS,)
-
-        # Label: click adjusted by play_score threshold
-        click = tf.where(
-            parsed["play_score"] > 0.1,
-            tf.ones_like(parsed["click"]),
-            parsed["click"],
-        )
-
-        return all_ids, click
-
-    ds = raw_ds.map(parse_single, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = raw_ds.map(parse_single_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
 
     if max_records > 0:
         ds = ds.take(max_records)
@@ -326,6 +479,14 @@ def main():
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--val-split", type=float, default=0.1,
                         help="Fraction of data held out for validation")
+    parser.add_argument("--stream", action="store_true", default=True,
+                        help="Stream data from disk (default, avoids OOM on large data)")
+    parser.add_argument("--no-stream", action="store_false", dest="stream",
+                        help="Pre-load all data into RAM (original behavior)")
+    parser.add_argument("--stats-samples", type=int, default=10000,
+                        help="Records to sample for stats estimation in stream mode")
+    parser.add_argument("--shuffle-buffer", type=int, default=10000,
+                        help="tf.data shuffle buffer size for streaming mode")
     args = parser.parse_args()
 
     batch_size   = args.batch_size
@@ -345,6 +506,8 @@ def main():
     print("HashEmb Stability Test — Real TFRecord Data")
     print("=" * 70)
     print(f"  Data pattern:          {args.data}")
+    print(f"  Mode:                  "
+          f"{'STREAMING (lazy from disk)' if args.stream else 'PRE-LOAD (all in RAM)'}")
     print(f"  Max records:           {max_records:,} (0=unlimited)")
     print(f"  Batch size:            {batch_size:,}")
     print(f"  Feat IDs / sample:     ≤ {MAX_FEATS}  "
@@ -362,50 +525,116 @@ def main():
     print()
 
     # =========================================================================
-    # Load data
+    # Load data (streaming or pre-load)
     # =========================================================================
     mem0 = mem_rss_mb()
     print(f"[MEM] Before load: {mem0:.0f} MB")
 
-    t_load = time.time()
-    feat_arr, label_arr, n_discarded, ds_stats = \
-        load_tfrecord_data(args.data, max_records)
-    t_load = time.time() - t_load
-
-    mem1 = mem_rss_mb()
-    n_total = len(label_arr)
-    n_pos = int(label_arr.sum())
-    print(f"  Label balance: {n_pos:,} / {n_total:,} "
-          f"({100 * n_pos / n_total:.1f}%)")
-    print(f"  Raw feat ID range: [{ds_stats['feat_id_min']:,}, "
-          f"{ds_stats['feat_id_max']:,}]")
-    print(f"  Avg valid feats/sample: {ds_stats['n_valid_feats_mean']:.1f} "
-          f"± {ds_stats['n_valid_feats_std']:.1f}")
-    print(f"[MEM] After load:  {mem1:.0f} MB  (+{mem1 - mem0:.0f} MB, "
-          f"{t_load:.1f}s)")
-    print()
-
-    # Train / val split
-    rng = np.random.RandomState(SEED)
-    n_val = max(1, int(n_total * val_split))
-    perm = rng.permutation(n_total)
-    val_idx = perm[:n_val]
-    train_idx = perm[n_val:]
-
-    train_ds = RealDataDataset(feat_arr[train_idx], label_arr[train_idx])
-    val_ds   = RealDataDataset(feat_arr[val_idx],   label_arr[val_idx])
-
-    n_batches = len(train_ds) // batch_size
+    n_discarded = 0
+    ds_stats = {}
     lookups_per_batch = batch_size * MAX_FEATS
 
-    train_loader = DataLoader(train_ds, batch_size, shuffle=True,
-                              collate_fn=collate_fn, drop_last=True)
-    val_loader   = DataLoader(val_ds,   batch_size, shuffle=False,
-                              collate_fn=collate_fn, drop_last=False)
+    if args.stream:
+        # ── Streaming mode ──
+        print(f"  Mode: STREAMING (lazy read from disk,"
+              f" shuffle_buffer={args.shuffle_buffer:,})")
 
-    print(f"  Train: {len(train_ds):,}  Val: {len(val_ds):,}  "
-          f"Batches/epoch: {n_batches}")
-    print()
+        # Estimate stats from first K records
+        t_load = time.time()
+        ds_stats = estimate_streaming_stats(args.data, args.stats_samples)
+        t_load = time.time() - t_load
+
+        if ds_stats is not None:
+            print(f"  Stats estimated from {ds_stats['n_samples_est']:,} records"
+                  f" ({ds_stats.get('est_time_s', 0):.1f}s):")
+            print(f"    Est. avg valid feats/sample: {ds_stats['n_valid_feats_mean']:.1f}")
+            print(f"    Est. feat_id range: ["
+                  f"{ds_stats['feat_id_min']:,}, {ds_stats['feat_id_max']:,}]")
+            print(f"    Est. label pos ratio: {ds_stats['label_pos_ratio']:.3f}")
+        else:
+            print("  Stats estimation skipped (--stats-samples=0)")
+
+        train_ds = StreamingTFRecordDataset(
+            args.data,
+            max_records=max_records,
+            split="train",
+            val_split=val_split,
+            seed=SEED,
+            shuffle_buffer_size=args.shuffle_buffer,
+        )
+        val_ds = StreamingTFRecordDataset(
+            args.data,
+            max_records=max_records,
+            split="val",
+            val_split=val_split,
+            seed=SEED,
+            shuffle_buffer_size=0,  # no shuffle for val
+        )
+
+        print(f"  Train files: {train_ds.n_files}  Val files: {val_ds.n_files}")
+
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size,
+            collate_fn=collate_fn, drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size,
+            collate_fn=collate_fn, drop_last=False,
+        )
+
+        # n_batches discovered during first epoch
+        n_batches = None
+
+        mem1 = mem_rss_mb()
+        if ds_stats:
+            print(f"  Est. label balance: positive ratio = "
+                  f"{ds_stats['label_pos_ratio']:.1%}")
+        print(f"[MEM] After dataset init:  {mem1:.0f} MB  "
+              f"(+{mem1 - mem0:.0f} MB)")
+        print()
+
+    else:
+        # ── Pre-load mode (original behavior) ──
+        print("  Mode: PRE-LOAD (all data in RAM)")
+
+        t_load = time.time()
+        feat_arr, label_arr, n_discarded, ds_stats = \
+            load_tfrecord_data(args.data, max_records)
+        t_load = time.time() - t_load
+
+        mem1 = mem_rss_mb()
+        n_total = len(label_arr)
+        n_pos = int(label_arr.sum())
+        print(f"  Label balance: {n_pos:,} / {n_total:,} "
+              f"({100 * n_pos / n_total:.1f}%)")
+        print(f"  Raw feat ID range: [{ds_stats['feat_id_min']:,}, "
+              f"{ds_stats['feat_id_max']:,}]")
+        print(f"  Avg valid feats/sample: {ds_stats['n_valid_feats_mean']:.1f} "
+              f"± {ds_stats['n_valid_feats_std']:.1f}")
+        print(f"[MEM] After load:  {mem1:.0f} MB  (+{mem1 - mem0:.0f} MB, "
+              f"{t_load:.1f}s)")
+        print()
+
+        # Train / val split
+        rng = np.random.RandomState(SEED)
+        n_val = max(1, int(n_total * val_split))
+        perm = rng.permutation(n_total)
+        val_idx = perm[:n_val]
+        train_idx = perm[n_val:]
+
+        train_ds_inner = RealDataDataset(feat_arr[train_idx], label_arr[train_idx])
+        val_ds_inner   = RealDataDataset(feat_arr[val_idx],   label_arr[val_idx])
+
+        n_batches = len(train_ds_inner) // batch_size
+
+        train_loader = DataLoader(train_ds_inner, batch_size, shuffle=True,
+                                  collate_fn=collate_fn, drop_last=True)
+        val_loader   = DataLoader(val_ds_inner,   batch_size, shuffle=False,
+                                  collate_fn=collate_fn, drop_last=False)
+
+        print(f"  Train: {len(train_ds_inner):,}  Val: {len(val_ds_inner):,}  "
+              f"Batches/epoch: {n_batches}")
+        print()
 
     # =========================================================================
     # Model
@@ -449,9 +678,14 @@ def main():
         if duration and (time.time() - wall_start) > duration:
             break
 
+        # Set epoch for deterministic per-epoch shuffle in streaming mode
+        if args.stream:
+            train_ds.set_epoch(epoch)
+
         model.train()
         ep_loss = 0.0
         ep_fwd, ep_bwd, ep_step, ep_tot = [], [], [], []
+        n_batches_this_epoch = 0
 
         for bi, (batch_ids, labels) in enumerate(train_loader):
             t0 = time.perf_counter()
@@ -472,6 +706,7 @@ def main():
             ep_bwd.append(t2 - t1)
             ep_step.append(t3 - t2)
             ep_tot.append(t3 - t0)
+            n_batches_this_epoch += 1
 
         # ── Validation ──
         model.eval()
@@ -501,11 +736,18 @@ def main():
         avg_tot  = np.mean(ep_tot) * 1000
         tput     = lookups_per_batch / (avg_tot / 1000) / 1e6
 
+        # Discover n_batches from first streaming epoch
+        if n_batches is None:
+            n_batches = n_batches_this_epoch
+            if args.stream:
+                print(f"  Discovered {n_batches} batches/epoch from first epoch")
+
         snap_mem.append((epoch, cur_mem, n_ent))
         snap_timing.append((epoch, avg_fwd, avg_bwd, avg_step, avg_tot))
         snap_auc.append((epoch, auc))
 
-        print(f"{epoch:4d} | {ep_loss / n_batches:7.4f} {auc:7.4f} | "
+        avg_loss = ep_loss / max(n_batches_this_epoch, 1)
+        print(f"{epoch:4d} | {avg_loss:7.4f} {auc:7.4f} | "
               f"{n_ent:10,d} {cur_mem:8.0f} {mem_delta:+6.0f} | "
               f"{avg_fwd:6.1f} {avg_bwd:6.1f} {avg_step:6.1f} {avg_tot:6.1f} | "
               f"{tput:9.1f}")
@@ -536,8 +778,8 @@ def main():
     print(f"  Total epochs:   {epoch}")
     print(f"  Total time:     {total_time:.1f}s "
           f"({total_time / max(epoch, 1):.1f}s/epoch)")
-    print(f"  Total batches:  {epoch * n_batches:,}")
-    print(f"  Total lookups:  {epoch * n_batches * batch_size * MAX_FEATS:,}")
+    print(f"  Total batches:  {epoch * (n_batches or 0):,}")
+    print(f"  Total lookups:  {epoch * (n_batches or 0) * batch_size * MAX_FEATS:,}")
     print()
 
     # ── Entry / memory growth ──
