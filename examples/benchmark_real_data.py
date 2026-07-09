@@ -487,6 +487,8 @@ def main():
                         help="Records to sample for stats estimation in stream mode")
     parser.add_argument("--shuffle-buffer", type=int, default=10000,
                         help="tf.data shuffle buffer size for streaming mode")
+    parser.add_argument("--log-interval", type=int, default=10,
+                        help="Print progress every N batches within each epoch")
     args = parser.parse_args()
 
     batch_size   = args.batch_size
@@ -687,6 +689,11 @@ def main():
         ep_fwd, ep_bwd, ep_step, ep_tot = [], [], [], []
         n_batches_this_epoch = 0
 
+        # Per-interval accumulators (reset every --log-interval batches)
+        int_loss = 0.0
+        int_fwd, int_bwd, int_step, int_tot = [], [], [], []
+        log_interval = args.log_interval
+
         for bi, (batch_ids, labels) in enumerate(train_loader):
             t0 = time.perf_counter()
             opt.zero_grad()
@@ -701,12 +708,45 @@ def main():
             model.step()
             t3 = time.perf_counter()
 
+            dt_fwd, dt_bwd, dt_step = t1 - t0, t2 - t1, t3 - t2
+            dt_tot = dt_fwd + dt_bwd + dt_step
+
             ep_loss += loss.item()
-            ep_fwd.append(t1 - t0)
-            ep_bwd.append(t2 - t1)
-            ep_step.append(t3 - t2)
-            ep_tot.append(t3 - t0)
+            ep_fwd.append(dt_fwd)
+            ep_bwd.append(dt_bwd)
+            ep_step.append(dt_step)
+            ep_tot.append(dt_tot)
             n_batches_this_epoch += 1
+
+            int_loss += loss.item()
+            int_fwd.append(dt_fwd)
+            int_bwd.append(dt_bwd)
+            int_step.append(dt_step)
+            int_tot.append(dt_tot)
+
+            # ── Per-interval progress ──
+            if (bi + 1) % log_interval == 0:
+                n_int = len(int_fwd)
+                avg_i_loss  = int_loss / n_int
+                avg_i_fwd   = np.mean(int_fwd) * 1000
+                avg_i_bwd   = np.mean(int_bwd) * 1000
+                avg_i_step  = np.mean(int_step) * 1000
+                avg_i_total = avg_i_fwd + avg_i_bwd + avg_i_step
+                i_tput      = lookups_per_batch / (avg_i_total / 1000) / 1e6
+                n_ent_now   = model.emb.num_entries
+                batch_info   = f"{bi + 1}"
+                if n_batches is not None:
+                    batch_info += f"/{n_batches}"
+
+                print(f"  [Ep {epoch}, bat {batch_info:<9s}] "
+                      f"loss={avg_i_loss:.4f}  "
+                      f"ent={n_ent_now:>9,d}  "
+                      f"fwd={avg_i_fwd:5.1f} bwd={avg_i_bwd:5.1f} "
+                      f"step={avg_i_step:5.1f} tot={avg_i_total:5.1f}ms  "
+                      f"tput={i_tput:.1f}M/s")
+
+                int_loss = 0.0
+                int_fwd, int_bwd, int_step, int_tot = [], [], [], []
 
         # ── Validation ──
         model.eval()
