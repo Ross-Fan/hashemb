@@ -692,6 +692,7 @@ def main():
         # Per-interval accumulators (reset every --log-interval batches)
         int_loss = 0.0
         int_fwd, int_bwd, int_step, int_tot = [], [], [], []
+        int_t_start = time.perf_counter()
         log_interval = args.log_interval
 
         for bi, (batch_ids, labels) in enumerate(train_loader):
@@ -727,6 +728,8 @@ def main():
             # ── Per-interval progress ──
             if (bi + 1) % log_interval == 0:
                 n_int = len(int_fwd)
+                int_elapsed = time.perf_counter() - int_t_start
+                avg_per_bat  = int_elapsed / n_int * 1000  # ms/batch
                 avg_i_loss  = int_loss / n_int
                 avg_i_fwd   = np.mean(int_fwd) * 1000
                 avg_i_bwd   = np.mean(int_bwd) * 1000
@@ -742,11 +745,13 @@ def main():
                       f"loss={avg_i_loss:.4f}  "
                       f"ent={n_ent_now:>9,d}  "
                       f"fwd={avg_i_fwd:5.1f} bwd={avg_i_bwd:5.1f} "
-                      f"step={avg_i_step:5.1f} tot={avg_i_total:5.1f}ms  "
+                      f"step={avg_i_step:5.1f} "
+                      f"int={int_elapsed:.1f}s({avg_per_bat:.0f}ms/bat)  "
                       f"tput={i_tput:.1f}M/s")
 
                 int_loss = 0.0
                 int_fwd, int_bwd, int_step, int_tot = [], [], [], []
+                int_t_start = time.perf_counter()
 
         # ── Validation ──
         model.eval()
