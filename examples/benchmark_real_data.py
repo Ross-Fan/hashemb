@@ -1,85 +1,83 @@
 #!/usr/bin/env python3
 """
-HashEmb stability / stress test with real TFRecord data.
+HashEmb stability / stress test with real data (Parquet format).
 
-Reads TFRecord (gzip compressed), parses features using the same schema
-as the TF training pipeline, and runs sustained HashEmb training with
-per-epoch memory/timing/AUC monitoring.
+Reads Parquet files (snappy compressed), reconstructs feat_ids from
+columnar storage, and runs sustained HashEmb training with per-epoch
+memory/timing/AUC monitoring.
 
-Feature schema (matching ModelConfig):
+Feature schema (matching Spark V005 → Parquet):
   - 63 discrete features: dis_00 … dis_62  (scalar int64)
-  -  2 seq1 features:     dis_63, dis_64   (var-length, pad to 5)
-  -  6 seq2 features:     dis_65–dis_70    (var-length, pad to 10 or 30)
-  - Max 193 feat IDs per sample (63 discrete + 2×5 + 3×30 + 3×10)
+  - 12 sequence features: dis_63 … dis_74  (list<int>, pad to fixed max lengths)
+  - Max 233 feat IDs per sample (63 + 5+5+30+30+30+10+10+10+10+10+10+10)
   - Label: click (adjusted by play_score threshold 0.1)
 
 Dependencies:
-    pip install tensorflow  # for TFRecord parsing (already in your env)
+    pip install pyarrow  # for Parquet reading
 
 Usage:
-    # Default: read up to 2M records, train 100 epochs
-    python examples/benchmark_real_data.py --data "/path/to/*.tfrecord.gz"
+    # Default: read up to 2M records, train 100 epochs, streaming from Parquet
+    python examples/benchmark_real_data.py --data "/path/to/*.parquet"
 
     # Long stability test
-    python examples/benchmark_real_data.py --data "data/*.tfrecord.gz" --steps 500
-
-    # Time-based: run for 30 minutes
-    python examples/benchmark_real_data.py --data "data/*.tfrecord.gz" --duration 1800
+    python examples/benchmark_real_data.py --data "data/*.parquet" --steps 500
 
     # Read ALL records (0 = unlimited)
-    python examples/benchmark_real_data.py --data "data/*.tfrecord.gz" --max-records 0
+    python examples/benchmark_real_data.py --data "data/*.parquet" --max-records 0
 
     # More capacity, larger block size
-    python examples/benchmark_real_data.py --data "data/*.tfrecord.gz" --capacity 20000000 --block-size 1000000
+    python examples/benchmark_real_data.py --data "data/*.parquet" --capacity 20000000 --block-size 1000000
 """
 
 import argparse
+import glob
 import resource
 import sys
 import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score
 
 from hashemb import HashEmbedding
 
 # =============================================================================
-# TFRecord parsing (uses tensorflow — already in user's environment)
+# Parquet reading (pyarrow — lightweight, no TensorFlow dependency)
 # =============================================================================
 try:
-    import tensorflow as tf
+    import pyarrow.parquet as pq
 except ImportError:
-    print("Error: tensorflow is required for TFRecord parsing.")
-    print("  pip install tensorflow")
+    print("Error: pyarrow is required for Parquet reading.")
+    print("  pip install pyarrow")
     sys.exit(1)
 
 # =============================================================================
-# Feature schema — matching the user's ModelConfig
+# Feature schema — matching Spark V005 → Parquet columns
 # =============================================================================
-def _discrete_keys():
-    return [f"dis_{i:02d}" for i in range(63)]  # dis_00 … dis_62
+# 63 discrete (scalar int) features: dis_00 … dis_62
+N_DISCRETE = 63
 
-def _seq1_keys():
-    return {"dis_63": 5, "dis_64": 5}
+# 12 sequence (list<int>) features with their max lengths after padding
+SEQ_MAX_LENS = {
+    "dis_63": 5,   # ibb_tags_llm
+    "dis_64": 5,   # ibb_titles
+    "dis_65": 30,  # app_feat
+    "dis_66": 30,  # x_gameid_app_feat
+    "dis_67": 30,  # user_sequence_basic
+    "dis_68": 10,  # user_continue_play_sequence
+    "dis_69": 10,  # user_real_click_sequence
+    "dis_70": 10,  # user_real_play_sequence
+    "dis_71": 10,  # user_seq_cate_stat_bucket01
+    "dis_72": 10,  # user_seq_cate_stat_bucket02
+    "dis_73": 10,  # user_seq_cate_stat_bucket03
+    "dis_74": 10,  # x_game_id_user_cate_stat_03
+}
 
-def _seq2_keys():
-    return {
-        "dis_65": 30, "dis_66": 30, "dis_67": 30,
-        "dis_68": 10, "dis_69": 10, "dis_70": 10,
-    }
-
-def _all_seq_keys():
-    return {**_seq1_keys(), **_seq2_keys()}
-
-DISCRETE_KEYS   = _discrete_keys()                         # 63 keys
-SEQ1_KEYS       = _seq1_keys()                             # 2 keys, max 5 each
-SEQ2_KEYS       = _seq2_keys()                             # 6 keys, max 10/30 each
-ALL_SEQ_KEYS    = _all_seq_keys()                          # 8 keys total
-N_DISCRETE      = len(DISCRETE_KEYS)                       # 63
-N_SEQ           = len(ALL_SEQ_KEYS)                        # 8
-MAX_FEATS       = N_DISCRETE + sum(ALL_SEQ_KEYS.values())  # 63 + 130 = 193
+DISCRETE_KEYS = [f"dis_{i:02d}" for i in range(N_DISCRETE)]  # dis_00 … dis_62
+SEQ_KEYS      = list(SEQ_MAX_LENS.keys())                    # dis_63 … dis_74
+N_SEQ         = len(SEQ_KEYS)                                # 12
+MAX_FEATS     = N_DISCRETE + sum(SEQ_MAX_LENS.values())      # 63 + 170 = 233
 
 # =============================================================================
 # Defaults (can override via CLI)
@@ -97,83 +95,84 @@ PAD_VALUE = -1  # sentinel for seq padding in PyTorch tensors
 
 
 # =============================================================================
-# Shared TFRecord parsing (used by both pre-load and streaming paths)
+# Parquet → feat_ids conversion
 # =============================================================================
-def parse_single_tfrecord(example_proto):
-    """Parse a single TFRecord example protobuf into (feat_ids, label) tensors.
+def build_feat_ids_from_batch(batch):
+    """Convert a pyarrow RecordBatch into (feat_ids, labels) numpy arrays.
 
-    Mirrors the training pipeline's parse_tfrecord().
-    Returns (all_ids, click) where all_ids is (MAX_FEATS,) int64.
+    Parameters
+    ----------
+    batch : pyarrow.RecordBatch
+        Columns: ``dis_00`` … ``dis_74`` (int / list<int>), ``click`` (int),
+        ``play_score`` (float).
+
+    Returns
+    -------
+    feat_ids : (N, MAX_FEATS) int64, PAD_VALUE=-1 for padding
+    labels   : (N,) float32, 1.0 if play_score > 0.1 else click value
     """
-    feat_spec = {
-        "click":      tf.io.FixedLenFeature([], tf.int64),
-        "play_score": tf.io.FixedLenFeature([], tf.float32),
-    }
+    N = batch.num_rows
+
+    # Allocate output buffer filled with PAD_VALUE
+    feat_ids = np.full((N, MAX_FEATS), PAD_VALUE, dtype=np.int64)
+
+    # ── Discrete features: each is a scalar int64 column ──
+    col_offset = 0
     for k in DISCRETE_KEYS:
-        feat_spec[k] = tf.io.FixedLenFeature([], tf.int64)
-    for k in ALL_SEQ_KEYS:
-        feat_spec[k] = tf.io.VarLenFeature(tf.int64)
+        feat_ids[:, col_offset] = batch.column(k).to_numpy().astype(np.int64)
+        col_offset += 1
 
-    parsed = tf.io.parse_single_example(example_proto, feat_spec)
+    # ── Sequence features: each is a list<int> column → pad to max_len ──
+    for k in SEQ_KEYS:
+        max_len = SEQ_MAX_LENS[k]
+        lists = batch.column(k).to_pylist()
+        for i, row_list in enumerate(lists):
+            if row_list is None or len(row_list) == 0:
+                continue
+            n_copy = min(len(row_list), max_len)
+            feat_ids[i, col_offset:col_offset + n_copy] = row_list[:n_copy]
+        col_offset += max_len
 
-    # Discrete features → stack into 1D tensor
-    disc = tf.stack([parsed[k] for k in DISCRETE_KEYS])  # (63,)
+    # ── Labels: click adjusted by play_score threshold ──
+    click_col = batch.column("click").to_numpy().astype(np.float32)
+    play_score_col = batch.column("play_score").to_numpy().astype(np.float32)
+    labels = np.where(play_score_col > 0.1, 1.0, click_col).astype(np.float32)
 
-    # Sequence features → dense pad, flatten
-    seqs = []
-    for k, max_len in ALL_SEQ_KEYS.items():
-        dense = tf.sparse.to_dense(parsed[k], default_value=PAD_VALUE)
-        cur_len = tf.shape(dense)[0]
-        if cur_len < max_len:
-            dense = tf.pad(dense, [[0, max_len - cur_len]], constant_values=PAD_VALUE)
-        else:
-            dense = dense[:max_len]
-        seqs.append(dense)
-
-    # Concatenate all feature IDs: discrete + seq1 + seq2
-    all_ids = tf.concat([disc] + seqs, axis=0)  # (MAX_FEATS,)
-
-    # Label: click adjusted by play_score threshold
-    click = tf.where(
-        parsed["play_score"] > 0.1,
-        tf.ones_like(parsed["click"]),
-        parsed["click"],
-    )
-
-    return all_ids, click
+    return feat_ids, labels
 
 
 # =============================================================================
-# Streaming TFRecord Dataset (IterableDataset for large data)
+# Streaming Parquet Dataset (IterableDataset for large data)
 # =============================================================================
-class StreamingTFRecordDataset(torch.utils.data.IterableDataset):
-    """Lazy IterableDataset that streams TFRecord files from disk.
+class StreamingParquetDataset(torch.utils.data.IterableDataset):
+    """Lazy IterableDataset that streams Parquet files from disk via pyarrow.
 
     Designed for datasets too large to fit in memory (e.g. 100M+ records).
-    Builds a fresh tf.data pipeline inside __iter__() for fork safety.
+    Reads Parquet files in configurable row-group-sized chunks using
+    ``pq.ParquetFile.iter_batches()``.
 
     Train/val split is at the file level: the first ``val_split`` fraction
     of sorted files is reserved for validation.
     """
 
     def __init__(self, file_patterns, max_records=0, split="train",
-                 val_split=0.1, seed=42, shuffle_buffer_size=10000):
+                 val_split=0.1, seed=42, parquet_batch_size=65536):
         if split not in ("train", "val"):
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
 
         files = []
         for pattern in file_patterns:
-            matched = tf.io.gfile.glob(pattern)
+            matched = glob.glob(pattern)
             files.extend(matched)
         if not files:
             raise FileNotFoundError(
-                f"No TFRecord files found for patterns: {file_patterns}")
+                f"No Parquet files found for patterns: {file_patterns}")
         files.sort()
 
         # File-level train/val split
         n_val_files = max(1, int(len(files) * val_split))
         if n_val_files >= len(files):
-            n_val_files = max(1, len(files) - 1)  # ensure at least 1 train file
+            n_val_files = max(1, len(files) - 1)
         if split == "train":
             self._files = files[n_val_files:]
         else:
@@ -181,7 +180,7 @@ class StreamingTFRecordDataset(torch.utils.data.IterableDataset):
 
         self._max_records = max_records
         self._seed = seed
-        self._shuffle_buffer_size = shuffle_buffer_size
+        self._parquet_batch_size = parquet_batch_size
         self._epoch = 0
         self.n_files = len(self._files)
 
@@ -204,52 +203,43 @@ class StreamingTFRecordDataset(torch.utils.data.IterableDataset):
         rng = np.random.RandomState(self._seed + self._epoch)
         rng.shuffle(my_files)
 
-        # Build tf.data pipeline (fresh each __iter__, fork-safe)
-        ds = tf.data.TFRecordDataset(my_files, compression_type="GZIP")
-        ds = ds.map(parse_single_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
+        records_yielded = 0
+        for file_path in my_files:
+            pf = pq.ParquetFile(file_path)
+            for batch in pf.iter_batches(batch_size=self._parquet_batch_size):
+                feat_ids, labels = build_feat_ids_from_batch(batch)
 
-        if self._shuffle_buffer_size > 0:
-            ds = ds.shuffle(self._shuffle_buffer_size,
-                            seed=self._seed + self._epoch)
+                # Discard all-pad samples
+                valid_mask = (feat_ids != PAD_VALUE).any(axis=1)
+                feat_ids = feat_ids[valid_mask]
+                labels = labels[valid_mask]
 
-        if self._max_records > 0:
-            ds = ds.take(self._max_records)
-
-        for ids_tf, lbl_tf in ds:
-            ids_np = ids_tf.numpy().astype(np.int64)
-            lbl_np = lbl_tf.numpy().astype(np.float32)
-
-            # Discard all-pad samples (same as pre-load path)
-            if not (ids_np != PAD_VALUE).any():
-                continue
-
-            yield (torch.from_numpy(ids_np).long(),
-                   torch.tensor(float(lbl_np), dtype=torch.float32))
+                for i in range(len(labels)):
+                    yield (torch.from_numpy(feat_ids[i]).long(),
+                           torch.tensor(float(labels[i]), dtype=torch.float32))
+                    records_yielded += 1
+                    if self._max_records > 0 and records_yielded >= self._max_records:
+                        return
 
 
 # =============================================================================
-# Stats estimation for streaming mode
+# Parquet stats estimation (sampling first N records)
 # =============================================================================
-def estimate_streaming_stats(file_patterns, n_samples=10000):
-    """Estimate dataset statistics from the first N records.
+def estimate_parquet_stats(file_patterns, n_samples=10000):
+    """Estimate dataset statistics from the first ~N records.
 
-    Provides approximate stats without loading the full dataset.
-    Returns None if n_samples <= 0.
+    Reads Parquet files sequentially until n_samples valid records are seen.
+    Returns None if n_samples <= 0 or no records found.
     """
     if n_samples <= 0:
         return None
 
     files = []
     for pattern in file_patterns:
-        matched = tf.io.gfile.glob(pattern)
-        files.extend(matched)
+        files.extend(glob.glob(pattern))
     if not files:
         return None
     files.sort()
-
-    ds = (tf.data.TFRecordDataset(files, compression_type="GZIP")
-          .map(parse_single_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
-          .take(n_samples))
 
     total_valid = 0
     valid_counts = []
@@ -259,21 +249,29 @@ def estimate_streaming_stats(file_patterns, n_samples=10000):
     count = 0
     t0 = time.time()
 
-    for ids_tf, lbl_tf in ds:
-        ids_np = ids_tf.numpy()
-        lbl_np = lbl_tf.numpy()
+    for f in files:
+        pf = pq.ParquetFile(f)
+        for batch in pf.iter_batches(batch_size=min(n_samples, 10000)):
+            feat_ids, labels = build_feat_ids_from_batch(batch)
+            for i in range(len(labels)):
+                ids = feat_ids[i]
+                valid = ids[ids != PAD_VALUE]
+                n_valid = len(valid)
+                if n_valid == 0:
+                    continue
 
-        valid = ids_np[ids_np != PAD_VALUE]
-        n_valid = len(valid)
-        if n_valid == 0:
-            continue
-
-        total_valid += n_valid
-        valid_counts.append(n_valid)
-        feat_min = min(feat_min, valid.min())
-        feat_max = max(feat_max, valid.max())
-        n_pos += int(lbl_np > 0.5)
-        count += 1
+                total_valid += n_valid
+                valid_counts.append(n_valid)
+                feat_min = min(feat_min, valid.min())
+                feat_max = max(feat_max, valid.max())
+                n_pos += int(labels[i] > 0.5)
+                count += 1
+                if count >= n_samples:
+                    break
+            if count >= n_samples:
+                break
+        if count >= n_samples:
+            break
 
     t1 = time.time()
 
@@ -289,117 +287,6 @@ def estimate_streaming_stats(file_patterns, n_samples=10000):
         "n_samples_est": count,
         "est_time_s": t1 - t0,
     }
-
-
-# =============================================================================
-# TFRecord → numpy arrays (pre-loaded for fast PyTorch iteration)
-# =============================================================================
-def load_tfrecord_data(file_patterns, max_records):
-    """
-    Parse TFRecord files matching *file_patterns* (supports glob),
-    return (feat_ids_2d, labels, n_discarded, n_valid_feats_stats).
-
-    feat_ids_2d: (N, MAX_FEATS) int64 array,  padded with PAD_VALUE.
-    labels:      (N,) float32 array.
-    """
-    files = []
-    for pattern in file_patterns:
-        matched = tf.io.gfile.glob(pattern)
-        if not matched:
-            print(f"  WARNING: no files match '{pattern}'")
-            continue
-        files.extend(matched)
-
-    if not files:
-        raise FileNotFoundError(
-            f"No TFRecord files found for: {file_patterns}")
-
-    print(f"  Found {len(files)} file(s)")
-    files.sort()
-    for f in files[:5]:
-        print(f"    {f}")
-    if len(files) > 5:
-        print(f"    ... and {len(files) - 5} more")
-
-    # ── Build tf.data pipeline ──
-    raw_ds = tf.data.TFRecordDataset(files, compression_type="GZIP")
-    ds = raw_ds.map(parse_single_tfrecord, num_parallel_calls=tf.data.AUTOTUNE)
-
-    if max_records > 0:
-        ds = ds.take(max_records)
-
-    # ── Iterate TF dataset → accumulate numpy arrays ──
-    feat_rows = []
-    label_rows = []
-    total_feat_ids = 0
-    valid_feat_count = []
-    n_discarded = 0
-    t0 = time.time()
-
-    print(f"  Parsing TFRecord (max {max_records:,} records)...")
-    for i, (ids_t, lbl_t) in enumerate(ds):
-        ids_np = ids_t.numpy().astype(np.int64)
-        lbl_np = lbl_t.numpy().astype(np.float32)
-
-        # Quick sanity: discard samples with no valid features
-        n_valid = int((ids_np != PAD_VALUE).sum())
-        if n_valid == 0:
-            n_discarded += 1
-            continue
-
-        feat_rows.append(ids_np)
-        label_rows.append(lbl_np)
-        total_feat_ids += n_valid
-        valid_feat_count.append(n_valid)
-
-        if (i + 1) % 200_000 == 0:
-            elapsed = time.time() - t0
-            print(f"    ... {i + 1:>10,} records ({elapsed:.1f}s, "
-                  f"{len(feat_rows) / elapsed:.0f} rec/s)")
-
-    t1 = time.time()
-    n = len(feat_rows)
-
-    if n == 0:
-        raise RuntimeError("No valid records parsed — check data path and schema")
-
-    # Stack into 2D array
-    feat_arr = np.stack(feat_rows, axis=0)  # (N, MAX_FEATS)
-    label_arr = np.array(label_rows, dtype=np.float32)
-
-    avg_feats = total_feat_ids / n if n > 0 else 0
-    label_pos = label_arr.sum()
-
-    print(f"  Parsed {n:,} records in {t1 - t0:.1f}s "
-          f"({n / (t1 - t0):.0f} rec/s)")
-    print(f"  Discarded: {n_discarded} (all-feat-pad samples)")
-    print(f"  Avg feat IDs per sample: {avg_feats:.1f} / {MAX_FEATS} max")
-    print(f"  Unique feat IDs seen:    estimating during training...")
-
-    stats = {
-        "n_valid_feats_mean": avg_feats,
-        "n_valid_feats_std": float(np.std(valid_feat_count)),
-        "feat_id_min": int(feat_arr[feat_arr != PAD_VALUE].min()),
-        "feat_id_max": int(feat_arr[feat_arr != PAD_VALUE].max()),
-    }
-
-    return feat_arr, label_arr, n_discarded, stats
-
-
-# =============================================================================
-# PyTorch Dataset
-# =============================================================================
-class RealDataDataset(Dataset):
-    def __init__(self, feat_ids, labels):
-        self.feat_ids = feat_ids
-        self.labels = labels
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        return (torch.from_numpy(self.feat_ids[idx]).long(),
-                torch.tensor(self.labels[idx], dtype=torch.float32))
 
 
 def collate_fn(batch):
@@ -463,11 +350,11 @@ def mem_rss_mb():
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="HashEmb stability test with real TFRecord data")
+        description="HashEmb stability test with real Parquet data")
     parser.add_argument("--data", nargs="+", required=True,
-                        help="TFRecord file pattern(s), e.g. 'data/*.tfrecord.gz'")
+                        help="Parquet file pattern(s), e.g. 'data/*.parquet'")
     parser.add_argument("--max-records", type=int, default=MAX_RECORDS,
-                        help="Max records to load (0 = unlimited)")
+                        help="Max records to load per epoch (0 = unlimited)")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--steps", type=int, default=EPOCHS,
                         help="Number of epochs (ignored if --duration set)")
@@ -478,15 +365,11 @@ def main():
     parser.add_argument("--block-size", type=int, default=BLOCK_SIZE)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--val-split", type=float, default=0.1,
-                        help="Fraction of data held out for validation")
-    parser.add_argument("--stream", action="store_true", default=True,
-                        help="Stream data from disk (default, avoids OOM on large data)")
-    parser.add_argument("--no-stream", action="store_false", dest="stream",
-                        help="Pre-load all data into RAM (original behavior)")
+                        help="Fraction of files held out for validation")
     parser.add_argument("--stats-samples", type=int, default=10000,
-                        help="Records to sample for stats estimation in stream mode")
-    parser.add_argument("--shuffle-buffer", type=int, default=10000,
-                        help="tf.data shuffle buffer size for streaming mode")
+                        help="Records to sample for stats estimation")
+    parser.add_argument("--parquet-batch-size", type=int, default=65536,
+                        help="Rows per parquet.iter_batches() chunk")
     parser.add_argument("--log-interval", type=int, default=10,
                         help="Print progress every N batches within each epoch")
     args = parser.parse_args()
@@ -505,138 +388,84 @@ def main():
     # =========================================================================
     bytes_per_entry = EMBEDDING_DIM * 4 * 4  # Adam: weight + grad + m + v
     print("=" * 70)
-    print("HashEmb Stability Test — Real TFRecord Data")
+    print("HashEmb Stability Test — Real Parquet Data")
     print("=" * 70)
     print(f"  Data pattern:          {args.data}")
-    print(f"  Mode:                  "
-          f"{'STREAMING (lazy from disk)' if args.stream else 'PRE-LOAD (all in RAM)'}")
-    print(f"  Max records:           {max_records:,} (0=unlimited)")
+    print(f"  Max records/epoch:     {max_records:,} (0=unlimited)")
     print(f"  Batch size:            {batch_size:,}")
-    print(f"  Feat IDs / sample:     ≤ {MAX_FEATS}  "
+    print(f"  Parquet chunk size:    {args.parquet_batch_size:,}")
+    print(f"  Feat IDs / sample:     <= {MAX_FEATS}  "
           f"({N_DISCRETE} discrete + {N_SEQ} seq)")
     print(f"  Embedding dim:         {EMBEDDING_DIM}")
     print(f"  Hash capacity:         {capacity:,}")
     print(f"  Block size:            {block_size:,}")
     print(f"  Optimizer:             Adam, lr={lr}")
-    print(f"  Per-entry memory:      {bytes_per_entry} B (4 × float32)")
+    print(f"  Per-entry memory:      {bytes_per_entry} B (4 x float32)")
     print(f"  Epochs:                {epochs if not duration else 'until timeout'}")
     if duration:
         print(f"  Duration limit:        {duration}s")
-    print(f"  Val split:             {val_split:.0%}")
+    print(f"  Val split:             {val_split:.0%} (file-level)")
     print(f"  Debug:                 {args.debug}")
     print()
 
     # =========================================================================
-    # Load data (streaming or pre-load)
+    # Load data (always streaming from Parquet)
     # =========================================================================
     mem0 = mem_rss_mb()
     print(f"[MEM] Before load: {mem0:.0f} MB")
 
-    n_discarded = 0
-    ds_stats = {}
     lookups_per_batch = batch_size * MAX_FEATS
 
-    if args.stream:
-        # ── Streaming mode ──
-        print(f"  Mode: STREAMING (lazy read from disk,"
-              f" shuffle_buffer={args.shuffle_buffer:,})")
+    # ── Estimate stats from first K records ──
+    t_est = time.time()
+    ds_stats = estimate_parquet_stats(args.data, args.stats_samples)
+    t_est = time.time() - t_est
 
-        # Estimate stats from first K records
-        t_load = time.time()
-        ds_stats = estimate_streaming_stats(args.data, args.stats_samples)
-        t_load = time.time() - t_load
-
-        if ds_stats is not None:
-            print(f"  Stats estimated from {ds_stats['n_samples_est']:,} records"
-                  f" ({ds_stats.get('est_time_s', 0):.1f}s):")
-            print(f"    Est. avg valid feats/sample: {ds_stats['n_valid_feats_mean']:.1f}")
-            print(f"    Est. feat_id range: ["
-                  f"{ds_stats['feat_id_min']:,}, {ds_stats['feat_id_max']:,}]")
-            print(f"    Est. label pos ratio: {ds_stats['label_pos_ratio']:.3f}")
-        else:
-            print("  Stats estimation skipped (--stats-samples=0)")
-
-        train_ds = StreamingTFRecordDataset(
-            args.data,
-            max_records=max_records,
-            split="train",
-            val_split=val_split,
-            seed=SEED,
-            shuffle_buffer_size=args.shuffle_buffer,
-        )
-        val_ds = StreamingTFRecordDataset(
-            args.data,
-            max_records=max_records,
-            split="val",
-            val_split=val_split,
-            seed=SEED,
-            shuffle_buffer_size=0,  # no shuffle for val
-        )
-
-        print(f"  Train files: {train_ds.n_files}  Val files: {val_ds.n_files}")
-
-        train_loader = DataLoader(
-            train_ds, batch_size=batch_size,
-            collate_fn=collate_fn, drop_last=True,
-        )
-        val_loader = DataLoader(
-            val_ds, batch_size=batch_size,
-            collate_fn=collate_fn, drop_last=False,
-        )
-
-        # n_batches discovered during first epoch
-        n_batches = None
-
-        mem1 = mem_rss_mb()
-        if ds_stats:
-            print(f"  Est. label balance: positive ratio = "
-                  f"{ds_stats['label_pos_ratio']:.1%}")
-        print(f"[MEM] After dataset init:  {mem1:.0f} MB  "
-              f"(+{mem1 - mem0:.0f} MB)")
-        print()
-
+    if ds_stats is not None:
+        print(f"  Stats estimated from {ds_stats['n_samples_est']:,} records"
+              f" ({ds_stats.get('est_time_s', 0):.1f}s):")
+        print(f"    Est. avg valid feats/sample: {ds_stats['n_valid_feats_mean']:.1f}")
+        print(f"    Est. feat_id range: ["
+              f"{ds_stats['feat_id_min']:,}, {ds_stats['feat_id_max']:,}]")
+        print(f"    Est. label pos ratio: {ds_stats['label_pos_ratio']:.3f}")
     else:
-        # ── Pre-load mode (original behavior) ──
-        print("  Mode: PRE-LOAD (all data in RAM)")
+        print("  Stats estimation skipped (--stats-samples=0)")
 
-        t_load = time.time()
-        feat_arr, label_arr, n_discarded, ds_stats = \
-            load_tfrecord_data(args.data, max_records)
-        t_load = time.time() - t_load
+    train_ds = StreamingParquetDataset(
+        args.data,
+        max_records=max_records,
+        split="train",
+        val_split=val_split,
+        seed=SEED,
+        parquet_batch_size=args.parquet_batch_size,
+    )
+    val_ds = StreamingParquetDataset(
+        args.data,
+        max_records=max_records,
+        split="val",
+        val_split=val_split,
+        seed=SEED,
+        parquet_batch_size=args.parquet_batch_size,
+    )
 
-        mem1 = mem_rss_mb()
-        n_total = len(label_arr)
-        n_pos = int(label_arr.sum())
-        print(f"  Label balance: {n_pos:,} / {n_total:,} "
-              f"({100 * n_pos / n_total:.1f}%)")
-        print(f"  Raw feat ID range: [{ds_stats['feat_id_min']:,}, "
-              f"{ds_stats['feat_id_max']:,}]")
-        print(f"  Avg valid feats/sample: {ds_stats['n_valid_feats_mean']:.1f} "
-              f"± {ds_stats['n_valid_feats_std']:.1f}")
-        print(f"[MEM] After load:  {mem1:.0f} MB  (+{mem1 - mem0:.0f} MB, "
-              f"{t_load:.1f}s)")
-        print()
+    print(f"  Train files: {train_ds.n_files}  Val files: {val_ds.n_files}")
 
-        # Train / val split
-        rng = np.random.RandomState(SEED)
-        n_val = max(1, int(n_total * val_split))
-        perm = rng.permutation(n_total)
-        val_idx = perm[:n_val]
-        train_idx = perm[n_val:]
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size,
+        collate_fn=collate_fn, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size,
+        collate_fn=collate_fn, drop_last=False,
+    )
 
-        train_ds_inner = RealDataDataset(feat_arr[train_idx], label_arr[train_idx])
-        val_ds_inner   = RealDataDataset(feat_arr[val_idx],   label_arr[val_idx])
-
-        n_batches = len(train_ds_inner) // batch_size
-
-        train_loader = DataLoader(train_ds_inner, batch_size, shuffle=True,
-                                  collate_fn=collate_fn, drop_last=True)
-        val_loader   = DataLoader(val_ds_inner,   batch_size, shuffle=False,
-                                  collate_fn=collate_fn, drop_last=False)
-
-        print(f"  Train: {len(train_ds_inner):,}  Val: {len(val_ds_inner):,}  "
-              f"Batches/epoch: {n_batches}")
-        print()
+    mem1 = mem_rss_mb()
+    if ds_stats:
+        print(f"  Est. label balance: positive ratio = "
+              f"{ds_stats['label_pos_ratio']:.1%}")
+    print(f"[MEM] After dataset init:  {mem1:.0f} MB  "
+          f"(+{mem1 - mem0:.0f} MB)")
+    print()
 
     # =========================================================================
     # Model
@@ -658,6 +487,7 @@ def main():
     # =========================================================================
     # Training with per-epoch monitoring
     # =========================================================================
+    n_batches = None   # discovered during first epoch
     snap_mem    = []   # (epoch, rss_mb, num_entries)
     snap_timing = []   # (epoch, fwd_ms, bwd_ms, step_ms, total_ms)
     snap_auc    = []   # (epoch, auc)
@@ -667,7 +497,7 @@ def main():
 
     print("-" * 95)
     print(f"{'Ep':>4s} | {'loss':>7s} {'auc':>7s} | "
-          f"{'entries':>10s} {'RSS(MB)':>8s} {'ΔMB':>6s} | "
+          f"{'entries':>10s} {'RSS(MB)':>8s} {'dMB':>6s} | "
           f"{'fwd':>6s} {'bwd':>6s} {'step':>6s} {'total':>6s} | "
           f"{'Mlookup/s':>9s}")
     print("-" * 95)
@@ -680,9 +510,7 @@ def main():
         if duration and (time.time() - wall_start) > duration:
             break
 
-        # Set epoch for deterministic per-epoch shuffle in streaming mode
-        if args.stream:
-            train_ds.set_epoch(epoch)
+        train_ds.set_epoch(epoch)
 
         model.train()
         ep_loss = 0.0
@@ -692,10 +520,10 @@ def main():
         # Per-interval accumulators (reset every --log-interval batches)
         int_loss = 0.0
         int_fwd, int_bwd, int_step, int_tot = [], [], [], []
-        int_data_time = []                     # data-loading time per batch
-        int_scores, int_labels = [], []        # for per-interval training AUC
+        int_data_time = []
+        int_scores, int_labels = [], []
         int_t_start = time.perf_counter()
-        t_prev_end = time.perf_counter()       # for measuring data-load time
+        t_prev_end = time.perf_counter()
         log_interval = args.log_interval
 
         for bi, (batch_ids, labels) in enumerate(train_loader):
@@ -740,7 +568,7 @@ def main():
             # ── Slow batch detection ──
             if dt_total > 5.0:
                 cur_ent = model.emb.num_entries
-                print(f"  ⚠ [Ep {epoch}, bat {bi + 1}] SLOW: "
+                print(f"  [Ep {epoch}, bat {bi + 1}] SLOW: "
                       f"data={dt_data:.2f}s comp={dt_comp:.3f}s "
                       f"(fwd={dt_fwd:.3f} bwd={dt_bwd:.3f} step={dt_step:.3f})  "
                       f"ent={cur_ent:,}",
@@ -750,7 +578,7 @@ def main():
             if (bi + 1) % log_interval == 0:
                 n_int = len(int_fwd)
                 int_elapsed = time.perf_counter() - int_t_start
-                avg_per_bat  = int_elapsed / n_int * 1000  # ms/batch
+                avg_per_bat  = int_elapsed / n_int * 1000
                 avg_i_loss   = int_loss / n_int
                 avg_i_fwd    = np.mean(int_fwd) * 1000
                 avg_i_bwd    = np.mean(int_bwd) * 1000
@@ -758,12 +586,11 @@ def main():
                 avg_data     = np.mean(int_data_time) * 1000
                 avg_comp     = np.mean(int_tot) * 1000
                 i_tput       = lookups_per_batch / (avg_comp / 1000) / 1e6
-                n_ent_now   = model.emb.num_entries
+                n_ent_now    = model.emb.num_entries
                 batch_info   = f"{bi + 1}"
                 if n_batches is not None:
                     batch_info += f"/{n_batches}"
 
-                # Per-interval training AUC (from this interval's batches)
                 try:
                     i_auc = roc_auc_score(
                         np.concatenate(int_labels),
@@ -799,7 +626,7 @@ def main():
                 np.concatenate(all_labels_gt),
                 np.concatenate(all_scores))
         except ValueError:
-            auc = 0.5  # single-class batch edge case
+            auc = 0.5
 
         # ── Metrics ──
         n_ent      = model.emb.num_entries
@@ -813,11 +640,10 @@ def main():
         avg_tot  = np.mean(ep_tot) * 1000
         tput     = lookups_per_batch / (avg_tot / 1000) / 1e6
 
-        # Discover n_batches from first streaming epoch
+        # Discover n_batches from first epoch
         if n_batches is None:
             n_batches = n_batches_this_epoch
-            if args.stream:
-                print(f"  Discovered {n_batches} batches/epoch from first epoch")
+            print(f"  Discovered {n_batches} batches/epoch from first epoch")
 
         snap_mem.append((epoch, cur_mem, n_ent))
         snap_timing.append((epoch, avg_fwd, avg_bwd, avg_step, avg_tot))
@@ -836,7 +662,7 @@ def main():
             print(f"  [DEBUG ep{epoch}] "
                   f"ent+{ent_delta:,}  "
                   f"w=[{w.min().item():+.4f}, {w.max().item():+.4f}]  "
-                  f"blocks≈{n_ent // block_size + 1}  "
+                  f"blocks={n_ent // block_size + 1}  "
                   f"mb/kent={mem_delta / (ent_delta + 1) * 1000:.2f}")
 
         prev_mem = cur_mem
@@ -877,7 +703,7 @@ def main():
         print(f"  Final RSS:      {mem_last:>10.0f} MB  (+{mem_growth:.0f} MB)")
         print(f"  MB / k entries: {mb_per_kent:.2f}  "
               f"(theoretical: {bytes_per_entry * 1000 / (1024**2):.2f} "
-              f"MB/k for Adam 4× buffers)")
+              f"MB/k for Adam 4x buffers)")
         print()
 
     # ── Timing stability ──
@@ -890,11 +716,11 @@ def main():
             delta_pct = 100 * delta / (first3 + 0.001)
             flag = ""
             if delta_pct > 5:
-                flag = f"  ⚠ +{delta_pct:.0f}% slower"
+                flag = f"  +{delta_pct:.0f}% slower"
             elif delta_pct < -5:
                 flag = "  (faster)"
-            print(f"  {label:6s}: {first3:6.1f}ms → {last3:6.1f}ms  "
-                  f"(Δ={delta:+.1f}ms, {delta_pct:+.1f}%){flag}")
+            print(f"  {label:6s}: {first3:6.1f}ms -> {last3:6.1f}ms  "
+                  f"(d={delta:+.1f}ms, {delta_pct:+.1f}%){flag}")
         print()
 
     # ── AUC ──
@@ -902,7 +728,7 @@ def main():
         aucs = [a for _, a in snap_auc]
         print(f"AUC:  start={aucs[0]:.4f}  best={max(aucs):.4f}  "
               f"final={aucs[-1]:.4f}  "
-              f"{'▲' if aucs[-1] > aucs[0] else '▼' if aucs[-1] < aucs[0] else '—'}")
+              f"{'up' if aucs[-1] > aucs[0] else 'down' if aucs[-1] < aucs[0] else '--'}")
         print()
 
     # ── Weight sanity ──
@@ -914,9 +740,9 @@ def main():
     w_mean, w_std = w.mean().item(), w.std().item()
 
     if nan_count > 0 or inf_count > 0:
-        print(f"✗ WEIGHT ISSUE: {nan_count} NaN, {inf_count} Inf detected!")
+        print(f"WEIGHT ISSUE: {nan_count} NaN, {inf_count} Inf detected!")
     else:
-        print(f"✓ Weights OK:  min={w_min:+.4f}  max={w_max:+.4f}  "
+        print(f"Weights OK:  min={w_min:+.4f}  max={w_max:+.4f}  "
               f"mean={w_mean:+.6f}  std={w_std:+.4f}")
 
     # ── Verdict ──
@@ -925,7 +751,7 @@ def main():
     if nan_count > 0 or inf_count > 0:
         issues.append("NaN/Inf in weights")
     if ent_growth <= 0 and epoch > 1:
-        issues.append("No entry growth after first epoch — "
+        issues.append("No entry growth after first epoch -- "
                       "is --max-records large enough?")
     theoretical_mb_per_k = bytes_per_entry * 1000 / (1024 ** 2)
     if mb_per_kent > theoretical_mb_per_k * 2:
@@ -941,10 +767,10 @@ def main():
             issues.append(f"throughput degraded {slowdown_pct:.0f}% (moderate)")
 
     if not issues:
-        print("✓ STABILITY PASS — no issues detected")
+        print("STABILITY PASS -- no issues detected")
     else:
         for issue in issues:
-            print(f"⚠ {issue}")
+            print(f"WARNING: {issue}")
     print("=" * 70)
 
 
