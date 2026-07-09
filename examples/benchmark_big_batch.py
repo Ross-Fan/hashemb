@@ -1,26 +1,41 @@
 #!/usr/bin/env python3
 """
-Big-batch HashEmb benchmark at scale.
+Big-batch HashEmb stability / stress test.
+
+Tests HashEmb under sustained training with a LARGE table (entries grow
+over time as new feat IDs are encountered).  Monitors memory growth and
+per-batch timing to detect performance degradation.
 
 Scenario:
   - Batch size: 4096, 100 feat IDs per sample
-  - Feat IDs drawn from [1, 100M] hash space (too large for nn.Embedding)
-  - Binary labels (CTR-like), generated from learnable ground-truth embeddings
-  - Tests: correctness, per-batch timing, memory scaling under sustained training
+  - Feat IDs from [1, 100M] hash space (too large for nn.Embedding)
+  - 500K unique feat IDs in the pool → hash table grows to ~500K entries
+  - Binary labels (CTR-like), learnable signal from 2K signal features
+  - Long training: 100 epochs by default
 
-Synthetic data:
-  - 10K unique raw feat IDs randomly sampled from [1, 100M]
-  - Each sample picks 100 feat IDs from the pool
-  - 200 "signal" features determine labels via GT embeddings + linear model
-  - 80K training + 20K validation samples
+Memory monitoring per epoch:
+  - Current RSS (MB) and delta from previous epoch
+  - Table size (num_entries) and growth rate
+  - Estimated table memory vs measured RSS — warns on unexplained bloat
 
-Model: (B, 100) feat IDs → HashEmbedding → mean pool → Linear(1) → logit
+Stability checks at end:
+  - NaN/Inf in weights
+  - Throughput trend (degradation as table grows?)
+  - Memory per entry (stable or leaking?)
+  - Continuous block allocation (block_count)
 
 Usage:
+    # Default: 500K unique feat IDs, 100 epochs, batch=4096
     python examples/benchmark_big_batch.py
-    python examples/benchmark_big_batch.py --debug --steps 50
-    python examples/benchmark_big_batch.py --batch-size 8192
-    python examples/benchmark_big_batch.py --capacity 500000
+
+    # Heavy stress: 2M feat IDs, 500 epochs, small block → many expansions
+    python examples/benchmark_big_batch.py --unique-feats 2000000 --steps 500 --block-size 100000
+
+    # Time-based: run for ~10 minutes
+    python examples/benchmark_big_batch.py --duration 600
+
+    # Ultra-large hash space test
+    python examples/benchmark_big_batch.py --hash-range 1000000000
 """
 
 import argparse
@@ -40,15 +55,15 @@ from hashemb import HashEmbedding
 BATCH_SIZE = 4096
 FEATS_PER_SAMPLE = 100
 EMBEDDING_DIM = 16
-N_UNIQUE_FEATS = 10_000          # unique feat IDs in the data pool
-N_SIGNAL_FEATS = 200             # these determine the label
-HASH_ID_RANGE = 100_000_000       # 100M hash space
-N_TRAIN = 80_000                  # training samples
-N_VAL = 20_000                    # validation samples
-EPOCHS = 20
+N_UNIQUE_FEATS = 500_000            # unique feat IDs — key driver of table growth
+N_SIGNAL_FEATS = 2_000              # these determine the label
+HASH_ID_RANGE = 100_000_000         # 100M hash space
+N_TRAIN = 80_000                    # training samples per "epoch" (cycling)
+N_VAL = 10_000                      # validation samples
+EPOCHS = 100
 LR = 0.01
-HASH_CAPACITY = 100_000
-BLOCK_SIZE = 1_000_000
+HASH_CAPACITY = 2_000_000           # large enough for all unique IDs
+BLOCK_SIZE = 200_000                # smallish blocks → exercise expansion path
 SEED = 42
 
 torch.manual_seed(SEED)
@@ -59,65 +74,44 @@ np.random.seed(SEED)
 # Helpers
 # =============================================================================
 def mem_rss_mb():
-    """Return current RSS in MB."""
+    """Return current RSS in MB (Linux: ru_maxrss in KB)."""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
-def fmt_rate(val, total_sec):
-    """Human-readable rate: val/total_sec."""
-    if total_sec <= 0:
-        return "?"
-    rate = val / total_sec
-    if rate >= 1e6:
-        return f"{rate / 1e6:.1f}M/s"
-    elif rate >= 1e3:
-        return f"{rate / 1e3:.1f}K/s"
-    return f"{rate:.1f}/s"
-
-
 # =============================================================================
-# Synthetic data generation
+# Synthetic data
 # =============================================================================
-def generate_synthetic_data():
-    """
-    Generate CTR-like data with learnable signal.
+def generate_synthetic_data(n_unique, n_signal, hash_range, n_train, n_val,
+                            feats_per_sample, emb_dim, seed):
+    """Generate label-bearing data.  Signal features (first n_signal) determine
+    labels via fixed ground-truth embeddings + linear model.  Other features are
+    noise."""
+    rng = np.random.RandomState(seed)
 
-    Returns:
-        train_ids:  (N_TRAIN, FEATS_PER_SAMPLE) — raw feat IDs (sparse 1..100M)
-        train_labels: (N_TRAIN,) — binary
-        val_ids:    (N_VAL, FEATS_PER_SAMPLE)
-        val_labels: (N_VAL,)
-    """
-    rng = np.random.RandomState(SEED)
+    # Unique raw feat IDs sampled sparsely from hash_range
+    raw_ids = rng.choice(hash_range, size=n_unique, replace=False).astype(np.int64)
 
-    # 10K unique raw feat IDs from [1, 100M)
-    raw_feat_ids = rng.choice(HASH_ID_RANGE, size=N_UNIQUE_FEATS, replace=False).astype(np.int64)
-
-    # Ground-truth embeddings for signal features (first N_SIGNAL_FEATS)
-    gt_emb = rng.randn(N_UNIQUE_FEATS, EMBEDDING_DIM).astype(np.float32) * 0.1
-    gt_w = rng.randn(1, EMBEDDING_DIM).astype(np.float32) * 0.1
+    # Ground-truth: signal features have meaningful embeddings
+    gt_emb = rng.randn(n_unique, emb_dim).astype(np.float32) * 0.1
+    gt_w = rng.randn(1, emb_dim).astype(np.float32) * 0.1
     gt_b = float(rng.randn(1).astype(np.float32)[0] * 0.01)
 
-    def _gen(n_samples):
-        indices = rng.randint(0, N_UNIQUE_FEATS, size=(n_samples, FEATS_PER_SAMPLE), dtype=np.int64)
+    def _gen(n):
+        idx = rng.randint(0, n_unique, size=(n, feats_per_sample), dtype=np.int64)
         labels = []
-        for i in range(n_samples):
-            row = indices[i]
-            signal_in_row = row[row < N_SIGNAL_FEATS]
-            if len(signal_in_row) == 0:
+        for i in range(n):
+            row = idx[i]
+            sig = row[row < n_signal]
+            if len(sig) == 0:
                 p = 0.5
             else:
-                pooled = gt_emb[signal_in_row].mean(axis=0)
+                pooled = gt_emb[sig].mean(axis=0)
                 score = float(np.dot(pooled, gt_w[0]) + gt_b)
                 p = 1.0 / (1.0 + np.exp(-score))
             labels.append(1 if rng.random() < p else 0)
+        return raw_ids[idx].astype(np.int64), np.array(labels, dtype=np.float32)
 
-        raw_ids = raw_feat_ids[indices].astype(np.int64)
-        return raw_ids, np.array(labels, dtype=np.float32)
-
-    train_ids, train_labels = _gen(N_TRAIN)
-    val_ids, val_labels = _gen(N_VAL)
-    return train_ids, train_labels, val_ids, val_labels
+    return _gen(n_train), _gen(n_val), n_unique
 
 
 # =============================================================================
@@ -146,18 +140,17 @@ def collate_fn(batch):
 # Model
 # =============================================================================
 class BigBatchModel(torch.nn.Module):
-    def __init__(self, emb_dim, capacity, lr):
+    def __init__(self, emb_dim, capacity, lr, block_size):
         super().__init__()
         self.emb = HashEmbedding(emb_dim, capacity,
                                  optimizer="adam", lr=lr,
                                  initial_scale=0.01,
-                                 block_size=BLOCK_SIZE)
+                                 block_size=block_size)
         self.predict = torch.nn.Linear(emb_dim, 1)
         torch.nn.init.xavier_uniform_(self.predict.weight)
         torch.nn.init.zeros_(self.predict.bias)
 
     def forward(self, feat_ids):
-        # (B, F) → (B, F, D) → mean pool → (B, D) → (B,)
         embs = self.emb(feat_ids)
         pooled = embs.mean(dim=1)
         return self.predict(pooled).squeeze(-1)
@@ -170,63 +163,80 @@ class BigBatchModel(torch.nn.Module):
 # Main
 # =============================================================================
 def main():
-    # ── Args ──
-    parser = argparse.ArgumentParser(description="Big-batch HashEmb benchmark")
+    parser = argparse.ArgumentParser(description="HashEmb stability / stress test")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--steps", type=int, default=EPOCHS)
+    parser.add_argument("--duration", type=int, default=0,
+                        help="Run for N seconds (overrides --steps)")
+    parser.add_argument("--unique-feats", type=int, default=N_UNIQUE_FEATS)
+    parser.add_argument("--hash-range", type=int, default=HASH_ID_RANGE)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--capacity", type=int, default=HASH_CAPACITY)
+    parser.add_argument("--block-size", type=int, default=BLOCK_SIZE)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--timing-warmup", type=int, default=3,
-                        help="Batches to warm-up before timing (per epoch)")
     args = parser.parse_args()
 
     batch_size = args.batch_size
-    epochs = args.steps
+    epochs = args.steps if args.duration <= 0 else 999999
+    duration = args.duration
+    n_unique = args.unique_feats
+    hash_range = args.hash_range
     lr = args.lr
     capacity = args.capacity
-    n_batches = N_TRAIN // batch_size
+    block_size = args.block_size
 
-    # =========================================================================
-    # Header
-    # =========================================================================
+    n_batches = N_TRAIN // batch_size
+    lookups_per_batch = batch_size * FEATS_PER_SAMPLE
+    total_lookups_per_epoch = lookups_per_batch * n_batches
+
+    # ── Estimate scale ──
+    bytes_per_entry = EMBEDDING_DIM * 4 * 4  # Adam: weight,grad,m,v = 4 × float32
+    est_table_mb = n_unique * bytes_per_entry / (1024 ** 2)
+    est_blocks = max(1, (n_unique + block_size - 1) // block_size)
     print("=" * 70)
-    print("Big-Batch HashEmb Benchmark")
+    print("HashEmb Stability / Stress Test")
     print("=" * 70)
-    print(f"  Batch size:           {batch_size:,}")
-    print(f"  Feats per sample:     {FEATS_PER_SAMPLE}")
-    print(f"  Total lookups/batch:  {batch_size * FEATS_PER_SAMPLE:,}")
-    print(f"  Embedding dim:        {EMBEDDING_DIM}")
-    print(f"  Hash ID range:        [1, {HASH_ID_RANGE:,}]")
-    print(f"  Unique feat IDs:      {N_UNIQUE_FEATS:,}")
-    print(f"  Signal features:      {N_SIGNAL_FEATS}")
-    print(f"  Training samples:     {N_TRAIN:,}")
-    print(f"  Validation samples:   {N_VAL:,}")
-    print(f"  Batches/epoch:        {n_batches}")
-    print(f"  Epochs:               {epochs}")
-    print(f"  LR:                   {lr}")
-    print(f"  Capacity:             {capacity:,}")
-    print(f"  Block size:           {BLOCK_SIZE:,}")
-    print(f"  Debug:                {args.debug}")
+    print(f"  Batch size:            {batch_size:,}")
+    print(f"  Feats per sample:      {FEATS_PER_SAMPLE}")
+    print(f"  Lookups / batch:       {lookups_per_batch:,}")
+    print(f"  Lookups / epoch:       {total_lookups_per_epoch:,}")
+    print(f"  Embedding dim:         {EMBEDDING_DIM}")
+    print(f"  Hash ID range:         [1, {hash_range:,}]")
+    print(f"  Unique feat IDs:       {n_unique:,}")
+    print(f"  Signal features:       {N_SIGNAL_FEATS}")
+    print(f"  Est table memory:      {est_table_mb:.0f} MB ({n_unique:,} × {bytes_per_entry}B)")
+    print(f"  Block size:            {block_size:,} → ~{est_blocks} blocks expected")
+    print(f"  Capacity hint:         {capacity:,}")
+    print(f"  Training samples:      {N_TRAIN:,}")
+    print(f"  Batches / epoch:       {n_batches}")
+    print(f"  Epochs:                {epochs if not duration else 'until timeout'}")
+    if duration:
+        print(f"  Duration limit:        {duration}s")
+    print(f"  LR:                    {lr}")
+    print(f"  Debug:                 {args.debug}")
     print()
 
     # =========================================================================
     # Data
     # =========================================================================
     mem0 = mem_rss_mb()
-    print(f"[MEM] Before data gen: {mem0:.1f} MB")
+    print(f"[MEM] Baseline:  {mem0:.0f} MB")
     t0 = time.time()
 
-    train_ids, train_labels, val_ids, val_labels = generate_synthetic_data()
+    (train_ids, train_labels), (val_ids, val_labels), actual_unique = \
+        generate_synthetic_data(
+            n_unique, N_SIGNAL_FEATS, hash_range, N_TRAIN, N_VAL,
+            FEATS_PER_SAMPLE, EMBEDDING_DIM, SEED)
 
     t_data = time.time() - t0
     mem1 = mem_rss_mb()
-    print(f"  Data generated in {t_data:.1f}s")
+    print(f"  Data:         {n_unique:,} unique IDs ({N_TRAIN:,} train + {N_VAL:,} val) "
+          f"→ {t_data:.1f}s")
     print(f"  Label balance: train={train_labels.sum():.0f}/{len(train_labels)} "
           f"({100*train_labels.sum()/len(train_labels):.1f}%), "
           f"val={val_labels.sum():.0f}/{len(val_labels)} "
           f"({100*val_labels.sum()/len(val_labels):.1f}%)")
-    print(f"[MEM] After data gen:  {mem1:.1f} MB  (+{mem1 - mem0:.1f} MB)")
+    print(f"[MEM] +data:     {mem1:.0f} MB  (+{mem1 - mem0:.0f} MB)")
     print()
 
     train_ds = SparseFeatDataset(train_ids, train_labels)
@@ -243,72 +253,66 @@ def main():
     np.random.seed(SEED)
 
     mem2 = mem_rss_mb()
-    print(f"[MEM] Before model:    {mem2:.1f} MB")
-    print("Creating HashEmbedding...")
+    print(f"[MEM] Before model: {mem2:.0f} MB")
 
-    model = BigBatchModel(EMBEDDING_DIM, capacity, lr)
+    model = BigBatchModel(EMBEDDING_DIM, capacity, lr, block_size)
     opt = torch.optim.Adam(model.predict.parameters(), lr=lr)
 
     mem3 = mem_rss_mb()
-    print(f"  Initial entries:     {model.emb.num_entries:,}")
-    print(f"[MEM] After model:     {mem3:.1f} MB  (+{mem3 - mem2:.1f} MB)")
+    print(f"  Initial entries: {model.emb.num_entries:,}")
+    print(f"[MEM] +model:        {mem3:.0f} MB  (+{mem3 - mem2:.0f} MB)")
     print()
 
     # =========================================================================
-    # Training with per-batch timing
+    # Training with per-epoch monitoring
     # =========================================================================
-    # We collect timing for all batches (after warmup) to compute stats
-    all_times = {"fwd": [], "bwd": [], "step": [], "total": []}
-    all_aucs = []
-    all_ent = []
+    # Snapshots for stability analysis
+    snap_mem = []       # (epoch, rss_mb, num_entries)
+    snap_timing = []    # (epoch, fwd_ms, bwd_ms, step_ms, total_ms)
+    snap_auc = []       # (epoch, auc)
+    prev_mem = mem3
+    prev_ent = 0
+    wall_start = time.time()
 
-    total_t0 = time.time()
+    print("-" * 90)
+    print(f"{'Ep':>4s} | {'loss':>7s} {'auc':>7s} | "
+          f"{'entries':>10s} {'RSS(MB)':>8s} {'ΔMB':>6s} | "
+          f"{'fwd':>6s} {'bwd':>6s} {'step':>6s} {'total':>6s} | {'Mlookup/s':>9s}")
+    print("-" * 90)
 
-    for epoch in range(1, epochs + 1):
+    epoch = 0
+    while True:
+        epoch += 1
+        if epoch > epochs:
+            break
+        if duration and (time.time() - wall_start) > duration:
+            break
+
         model.train()
         ep_loss = 0.0
-
-        # Per-batch timing for this epoch
-        ep_fwd = []
-        ep_bwd = []
-        ep_step = []
-        ep_tot = []
+        ep_fwd, ep_bwd, ep_step, ep_tot = [], [], [], []
 
         for bi, (batch_ids, labels) in enumerate(train_loader):
-            # Forward
             t0 = time.perf_counter()
             opt.zero_grad()
             logits = model(batch_ids)
             loss = F.binary_cross_entropy_with_logits(logits, labels)
             t1 = time.perf_counter()
 
-            # Backward
             loss.backward()
             t2 = time.perf_counter()
 
-            # Step: dense + hash
             opt.step()
             model.step()
             t3 = time.perf_counter()
 
             ep_loss += loss.item()
+            ep_fwd.append(t1 - t0)
+            ep_bwd.append(t2 - t1)
+            ep_step.append(t3 - t2)
+            ep_tot.append(t3 - t0)
 
-            # Collect timing (skip first N batches for warmup)
-            if bi >= args.timing_warmup:
-                ep_fwd.append(t1 - t0)
-                ep_bwd.append(t2 - t1)
-                ep_step.append(t3 - t2)
-                ep_tot.append(t3 - t0)
-
-            if args.debug and bi == 0:
-                print(f"  [ep{epoch:2d} batch 0] "
-                      f"loss={loss.item():.4f}  "
-                      f"fwd={1000*(t1-t0):.1f}ms  "
-                      f"bwd={1000*(t2-t1):.1f}ms  "
-                      f"step={1000*(t3-t2):.1f}ms  "
-                      f"mem={mem_rss_mb():.0f}MB")
-
-        # Validation
+        # ── Validation ──
         model.eval()
         all_scores, all_labels_gt = [], []
         with torch.no_grad():
@@ -316,114 +320,143 @@ def main():
                 logits = model(batch_ids)
                 all_scores.append(torch.sigmoid(logits).numpy())
                 all_labels_gt.append(labels.numpy())
-
         auc = roc_auc_score(np.concatenate(all_labels_gt),
                             np.concatenate(all_scores))
+
+        # ── Metrics ──
         n_ent = model.emb.num_entries
-        all_aucs.append(auc)
-        all_ent.append(n_ent)
+        cur_mem = mem_rss_mb()
+        mem_delta = cur_mem - prev_mem
+        ent_delta = n_ent - prev_ent
 
-        # Aggregate timing for this epoch
-        if ep_tot:
-            avg_fwd = np.mean(ep_fwd) * 1000
-            avg_bwd = np.mean(ep_bwd) * 1000
-            avg_step = np.mean(ep_step) * 1000
-            avg_tot = np.mean(ep_tot) * 1000
-            # Lookup throughput
-            lookups_per_batch = batch_size * FEATS_PER_SAMPLE
-            throughput = lookups_per_batch / np.mean(ep_tot)
+        avg_fwd = np.mean(ep_fwd) * 1000
+        avg_bwd = np.mean(ep_bwd) * 1000
+        avg_step = np.mean(ep_step) * 1000
+        avg_tot = np.mean(ep_tot) * 1000
+        tput = lookups_per_batch / (avg_tot / 1000) / 1e6
 
-            all_times["fwd"].append(avg_fwd)
-            all_times["bwd"].append(avg_bwd)
-            all_times["step"].append(avg_step)
-            all_times["total"].append(avg_tot)
+        snap_mem.append((epoch, cur_mem, n_ent))
+        snap_timing.append((epoch, avg_fwd, avg_bwd, avg_step, avg_tot))
+        snap_auc.append((epoch, auc))
 
-            print(f"  Ep {epoch:2d}: loss={ep_loss/n_batches:.4f}  "
-                  f"auc={auc:.4f}  entries={n_ent:,}  "
-                  f"[fwd={avg_fwd:.1f}ms bwd={avg_bwd:.1f}ms "
-                  f"step={avg_step:.1f}ms total={avg_tot:.1f}ms]  "
-                  f"({throughput/1e6:.1f}M lookup/s)  "
-                  f"mem={mem_rss_mb():.0f}MB")
-        else:
-            print(f"  Ep {epoch:2d}: loss={ep_loss/n_batches:.4f}  "
-                  f"auc={auc:.4f}  entries={n_ent:,}  "
-                  f"(all batches used for warmup)")
+        print(f"{epoch:4d} | {ep_loss/n_batches:7.4f} {auc:7.4f} | "
+              f"{n_ent:10,d} {cur_mem:8.0f} {mem_delta:+6.0f} | "
+              f"{avg_fwd:6.1f} {avg_bwd:6.1f} {avg_step:6.1f} {avg_tot:6.1f} | "
+              f"{tput:9.1f}")
 
-    total_time = time.time() - total_t0
+        # ── Detailed snapshot every 10 epochs ──
+        if args.debug and epoch % 10 == 0:
+            print(f"  [DEBUG ep{epoch}] ent_growth=+{ent_delta:,}  "
+                  f"mb_per_1k_ent={mem_delta/(ent_delta+1)*1000:.2f}  "
+                  f"blocks≈{n_ent//block_size + 1}  "
+                  f"table_fill={100*n_ent/n_unique:.1f}%")
+
+        prev_mem = cur_mem
+        prev_ent = n_ent
+
+    total_time = time.time() - wall_start
 
     # =========================================================================
     # Summary
     # =========================================================================
+    print("-" * 90)
     print()
     print("=" * 70)
-    print("Summary")
+    print("Stability Summary")
     print("=" * 70)
-
-    best_auc = max(all_aucs)
-    print(f"  Best AUC:            {best_auc:.4f} (epoch {all_aucs.index(best_auc)+1})")
-    print(f"  Final AUC:           {all_aucs[-1]:.4f}")
-    print(f"  AUC trend:           {'▲' if all_aucs[-1] > all_aucs[0] else '▼'} "
-          f"{all_aucs[0]:.4f} → {all_aucs[-1]:.4f}")
+    print(f"  Total epochs:   {epoch}")
+    print(f"  Total time:     {total_time:.1f}s ({total_time/epoch:.1f}s/epoch)")
+    print(f"  Total batches:  {epoch * n_batches:,}")
+    print(f"  Total lookups:  {epoch * total_lookups_per_epoch:,}")
     print()
 
-    # Per-batch timing stats (aggregated across all timed epochs)
-    if all_times["total"]:
-        print("Per-batch timing (mean ± std across epochs, after warmup):")
-        for k in ["fwd", "bwd", "step", "total"]:
-            arr = all_times[k]
-            print(f"  {k:6s}: {np.mean(arr):6.1f} ± {np.std(arr):5.1f} ms  "
-                  f"(min={np.min(arr):.1f}, max={np.max(arr):.1f})")
+    # ── Entry / memory growth ──
+    if len(snap_mem) >= 2:
+        ent_first = snap_mem[0][2]
+        ent_last = snap_mem[-1][2]
+        mem_first = snap_mem[0][1]
+        mem_last = snap_mem[-1][1]
+        ent_growth = ent_last - ent_first
+        mem_growth = mem_last - mem_first
+        mb_per_kent = (mem_growth / (ent_growth + 1)) * 1000
+        theoretical_b_per_entry = bytes_per_entry * 1000  # bytes per 1k entries
 
-        lookups_per_batch = batch_size * FEATS_PER_SAMPLE
-        avg_total_ms = np.mean(all_times["total"])
-        throughput = lookups_per_batch / (avg_total_ms / 1000)
-        print(f"  Throughput: {throughput/1e6:.1f}M lookups/s "
-              f"({lookups_per_batch * n_batches / total_time / 1e6:.1f}M/s overall)")
-    print()
+        # Table fill %
+        fill_pct = 100.0 * ent_last / n_unique
 
-    # Memory
-    mem_final = mem_rss_mb()
-    print(f"Memory:")
-    print(f"  Before:  {mem0:.0f} MB")
-    print(f"  Peak:    {max(mem_final, max([mem0, mem1, mem2, mem3])):.0f} MB")
-    print(f"  After:   {mem_final:.0f} MB  (+{mem_final - mem2:.0f} MB from model init)")
-    print(f"  Entries: {all_ent[0]:,} → {all_ent[-1]:,} "
-          f"(+{all_ent[-1] - all_ent[0]:,})")
-    bytes_per = EMBEDDING_DIM * 4 * 3  # Adam: weight + grad + m + v = 4×
-    est_table = all_ent[-1] * bytes_per / (1024**2)
-    print(f"  Est table: {est_table:.0f} MB ({all_ent[-1]:,} × {bytes_per}B/entry)")
-    print()
+        print("Entry & Memory Growth:")
+        print(f"  Entries:  {ent_first:>10,} → {ent_last:>10,}  "
+              f"(+{ent_growth:,}, {fill_pct:.1f}% of pool)")
+        print(f"  RSS:      {mem_first:>10.0f} → {mem_last:>10.0f} MB  "
+              f"(+{mem_growth:.0f} MB)")
+        print(f"  MB / k entries: {mb_per_kent:.2f}  "
+              f"(theoretical: {bytes_per_entry * 1000 / (1024**2):.2f} MB/k for Adam 4× buffers)")
+        print()
 
-    # Total time
-    print(f"Total time: {total_time:.1f}s ({total_time/epochs:.1f}s/epoch, "
-          f"{total_time/n_batches/epochs*1000:.1f}ms/batch)")
-    print()
+    # ── Timing stability ──
+    if len(snap_timing) >= 4:
+        print("Timing Stability (first 3 vs last 3 epochs):")
+        for idx, label in [(1, "fwd"), (2, "bwd"), (3, "step"), (4, "total")]:
+            first3 = np.mean([s[idx] for s in snap_timing[:3]])
+            last3 = np.mean([s[idx] for s in snap_timing[-3:]])
+            delta = last3 - first3
+            delta_pct = 100 * delta / (first3 + 0.001)
+            flag = ""
+            if delta_pct > 5:
+                flag = " ⚠ +{:.0f}% slow".format(delta_pct)
+            elif delta_pct < -5:
+                flag = " (faster)"
+            print(f"  {label:6s}: {first3:6.1f}ms → {last3:6.1f}ms  "
+                  f"(Δ={delta:+.1f}ms, {delta_pct:+.1f}%){flag}")
+        print()
 
-    # NaN check
+    # ── AUC ──
+    if snap_auc:
+        aucs = [a for _, a in snap_auc]
+        print(f"AUC:  start={aucs[0]:.4f}  best={max(aucs):.4f}  "
+              f"final={aucs[-1]:.4f}  "
+              f"{'▲' if aucs[-1] > aucs[0] else '▼' if aucs[-1] < aucs[0] else '—'}")
+        print()
+
+    # ── Weight sanity ──
     sd = model.emb.state_dict()
     w = sd["weight"]
     nan_count = torch.isnan(w).sum().item()
     inf_count = torch.isinf(w).sum().item()
+    w_min = w.min().item()
+    w_max = w.max().item()
+    w_mean = w.mean().item()
+    w_std = w.std().item()
+
     if nan_count > 0 or inf_count > 0:
-        print(f"✗ FOUND: {nan_count} NaN, {inf_count} Inf in weights!")
+        print(f"✗ WEIGHT ISSUE: {nan_count} NaN, {inf_count} Inf detected!")
     else:
-        print(f"✓ No NaN/Inf in weights "
-              f"(min={w.min().item():+.4f}, max={w.max().item():+.4f}, "
-              f"mean={w.mean().item():+.6f}, std={w.std().item():+.4f})")
+        print(f"✓ Weights OK:  min={w_min:+.4f}  max={w_max:+.4f}  "
+              f"mean={w_mean:+.6f}  std={w_std:+.4f}")
 
-    # Convergence check
-    if best_auc > 0.75:
-        print(f"✓ AUC > 0.75 — model is learning the signal")
-    elif best_auc > 0.65:
-        print(f"⚠ AUC = {best_auc:.4f} — moderate, may need more steps or tuning")
+    # ── Overall stability verdict ──
+    print()
+    issues = []
+    if nan_count > 0 or inf_count > 0:
+        issues.append("NaN/Inf in weights")
+    if ent_growth <= 0:
+        issues.append("No entry growth — all IDs seen in first epoch? Try larger --unique-feats")
+    if len(snap_timing) >= 4:
+        first3_total = np.mean([s[4] for s in snap_timing[:3]])
+        last3_total = np.mean([s[4] for s in snap_timing[-3:]])
+        slowdown_pct = 100 * (last3_total - first3_total) / (first3_total + 0.001)
+        if slowdown_pct > 20:
+            issues.append(f"timing degraded {slowdown_pct:.0f}%")
+        elif slowdown_pct > 10:
+            issues.append(f"timing degraded {slowdown_pct:.0f}% (moderate)")
+    if mb_per_kent > theoretical_b_per_entry * 2:
+        issues.append(f"memory/entry 2× above theoretical")
+
+    if not issues:
+        print("✓ STABILITY PASS — no issues detected")
     else:
-        print(f"✗ AUC = {best_auc:.4f} — model may not be learning (check data/debug)")
-
-    # Capacity check
-    if all_ent[-1] > capacity * 0.8:
-        print(f"⚠ Entries ({all_ent[-1]:,}) near capacity ({capacity:,}) — "
-              f"consider increasing")
-
+        for issue in issues:
+            print(f"⚠ {issue}")
     print("=" * 70)
 
 
