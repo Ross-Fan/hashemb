@@ -163,7 +163,9 @@ class EmbeddingTable {
 
   // Dirty-slot tracking for sparse step().
   // scatter_add_grad marks slots as dirty; step() only iterates dirty_slots_.
-  std::vector<bool> slot_dirty_;
+  // NOT std::vector<bool> — the packed bitset causes data races when writing
+  // different bools from parallel threads (adjacent bits share the same byte).
+  std::vector<uint8_t> slot_dirty_;
   std::vector<int32_t> dirty_slots_;
 
   HashTable hash_table_;
