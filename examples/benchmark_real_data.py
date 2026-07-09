@@ -692,11 +692,17 @@ def main():
         # Per-interval accumulators (reset every --log-interval batches)
         int_loss = 0.0
         int_fwd, int_bwd, int_step, int_tot = [], [], [], []
-        int_scores, int_labels = [], []   # for per-interval training AUC
+        int_data_time = []                     # data-loading time per batch
+        int_scores, int_labels = [], []        # for per-interval training AUC
         int_t_start = time.perf_counter()
+        t_prev_end = time.perf_counter()       # for measuring data-load time
         log_interval = args.log_interval
 
         for bi, (batch_ids, labels) in enumerate(train_loader):
+            # ── Data load time: wall clock since end of previous batch ──
+            t_fetch = time.perf_counter()
+            dt_data = t_fetch - t_prev_end
+
             t0 = time.perf_counter()
             opt.zero_grad()
             logits = model(batch_ids)
@@ -709,36 +715,49 @@ def main():
             opt.step()
             model.step()
             t3 = time.perf_counter()
+            t_prev_end = t3
 
             dt_fwd, dt_bwd, dt_step = t1 - t0, t2 - t1, t3 - t2
-            dt_tot = dt_fwd + dt_bwd + dt_step
+            dt_comp = dt_fwd + dt_bwd + dt_step
+            dt_total = dt_data + dt_comp
 
             ep_loss += loss.item()
             ep_fwd.append(dt_fwd)
             ep_bwd.append(dt_bwd)
             ep_step.append(dt_step)
-            ep_tot.append(dt_tot)
+            ep_tot.append(dt_comp)
             n_batches_this_epoch += 1
 
             int_loss += loss.item()
             int_fwd.append(dt_fwd)
             int_bwd.append(dt_bwd)
             int_step.append(dt_step)
-            int_tot.append(dt_tot)
+            int_tot.append(dt_comp)
+            int_data_time.append(dt_data)
             int_scores.append(torch.sigmoid(logits).detach().cpu().numpy())
             int_labels.append(labels.detach().cpu().numpy())
+
+            # ── Slow batch detection ──
+            if dt_total > 5.0:
+                cur_ent = model.emb.num_entries
+                print(f"  ⚠ [Ep {epoch}, bat {bi + 1}] SLOW: "
+                      f"data={dt_data:.2f}s comp={dt_comp:.3f}s "
+                      f"(fwd={dt_fwd:.3f} bwd={dt_bwd:.3f} step={dt_step:.3f})  "
+                      f"ent={cur_ent:,}",
+                      flush=True)
 
             # ── Per-interval progress ──
             if (bi + 1) % log_interval == 0:
                 n_int = len(int_fwd)
                 int_elapsed = time.perf_counter() - int_t_start
                 avg_per_bat  = int_elapsed / n_int * 1000  # ms/batch
-                avg_i_loss  = int_loss / n_int
-                avg_i_fwd   = np.mean(int_fwd) * 1000
-                avg_i_bwd   = np.mean(int_bwd) * 1000
-                avg_i_step  = np.mean(int_step) * 1000
-                avg_i_total = avg_i_fwd + avg_i_bwd + avg_i_step
-                i_tput      = lookups_per_batch / (avg_i_total / 1000) / 1e6
+                avg_i_loss   = int_loss / n_int
+                avg_i_fwd    = np.mean(int_fwd) * 1000
+                avg_i_bwd    = np.mean(int_bwd) * 1000
+                avg_i_step   = np.mean(int_step) * 1000
+                avg_data     = np.mean(int_data_time) * 1000
+                avg_comp     = np.mean(int_tot) * 1000
+                i_tput       = lookups_per_batch / (avg_comp / 1000) / 1e6
                 n_ent_now   = model.emb.num_entries
                 batch_info   = f"{bi + 1}"
                 if n_batches is not None:
@@ -755,13 +774,14 @@ def main():
                 print(f"  [Ep {epoch}, bat {batch_info:<9s}] "
                       f"loss={avg_i_loss:.4f} auc={i_auc:.4f}  "
                       f"ent={n_ent_now:>9,d}  "
-                      f"fwd={avg_i_fwd:5.1f} bwd={avg_i_bwd:5.1f} "
-                      f"step={avg_i_step:5.1f} "
-                      f"int={int_elapsed:.1f}s({avg_per_bat:.0f}ms/bat)  "
-                      f"tput={i_tput:.1f}M/s")
+                      f"data={avg_data:.0f}ms comp={avg_comp:.0f}ms("
+                      f"fwd={avg_i_fwd:.0f} bwd={avg_i_bwd:.0f} step={avg_i_step:.0f})  "
+                      f"bat={avg_per_bat:.0f}ms  tput={i_tput:.1f}M/s",
+                      flush=True)
 
                 int_loss = 0.0
                 int_fwd, int_bwd, int_step, int_tot = [], [], [], []
+                int_data_time = []
                 int_scores, int_labels = [], []
                 int_t_start = time.perf_counter()
 
