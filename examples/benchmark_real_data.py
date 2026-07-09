@@ -692,6 +692,7 @@ def main():
         # Per-interval accumulators (reset every --log-interval batches)
         int_loss = 0.0
         int_fwd, int_bwd, int_step, int_tot = [], [], [], []
+        int_scores, int_labels = [], []   # for per-interval training AUC
         int_t_start = time.perf_counter()
         log_interval = args.log_interval
 
@@ -724,6 +725,8 @@ def main():
             int_bwd.append(dt_bwd)
             int_step.append(dt_step)
             int_tot.append(dt_tot)
+            int_scores.append(torch.sigmoid(logits).detach().cpu().numpy())
+            int_labels.append(labels.detach().cpu().numpy())
 
             # ── Per-interval progress ──
             if (bi + 1) % log_interval == 0:
@@ -741,8 +744,16 @@ def main():
                 if n_batches is not None:
                     batch_info += f"/{n_batches}"
 
+                # Per-interval training AUC (from this interval's batches)
+                try:
+                    i_auc = roc_auc_score(
+                        np.concatenate(int_labels),
+                        np.concatenate(int_scores))
+                except ValueError:
+                    i_auc = float("nan")
+
                 print(f"  [Ep {epoch}, bat {batch_info:<9s}] "
-                      f"loss={avg_i_loss:.4f}  "
+                      f"loss={avg_i_loss:.4f} auc={i_auc:.4f}  "
                       f"ent={n_ent_now:>9,d}  "
                       f"fwd={avg_i_fwd:5.1f} bwd={avg_i_bwd:5.1f} "
                       f"step={avg_i_step:5.1f} "
@@ -751,6 +762,7 @@ def main():
 
                 int_loss = 0.0
                 int_fwd, int_bwd, int_step, int_tot = [], [], [], []
+                int_scores, int_labels = [], []
                 int_t_start = time.perf_counter()
 
         # ── Validation ──
