@@ -372,6 +372,8 @@ def main():
                         help="Rows per parquet.iter_batches() chunk")
     parser.add_argument("--log-interval", type=int, default=10,
                         help="Print progress every N batches within each epoch")
+    parser.add_argument("--num-workers", type=int, default=2,
+                        help="DataLoader workers for prefetch (0=main process only)")
     args = parser.parse_args()
 
     batch_size   = args.batch_size
@@ -394,6 +396,7 @@ def main():
     print(f"  Max records/epoch:     {max_records:,} (0=unlimited)")
     print(f"  Batch size:            {batch_size:,}")
     print(f"  Parquet chunk size:    {args.parquet_batch_size:,}")
+    print(f"  DataLoader workers:    {args.num_workers}")
     print(f"  Feat IDs / sample:     <= {MAX_FEATS}  "
           f"({N_DISCRETE} discrete + {N_SEQ} seq)")
     print(f"  Embedding dim:         {EMBEDDING_DIM}")
@@ -453,10 +456,12 @@ def main():
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,
         collate_fn=collate_fn, drop_last=True,
+        num_workers=args.num_workers,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size,
         collate_fn=collate_fn, drop_last=False,
+        num_workers=args.num_workers,
     )
 
     mem1 = mem_rss_mb()
