@@ -374,6 +374,8 @@ def main():
                         help="Print progress every N batches within each epoch")
     parser.add_argument("--num-workers", type=int, default=2,
                         help="DataLoader workers for prefetch (0=main process only)")
+    parser.add_argument("--prefetch-factor", type=int, default=2,
+                        help="Batches pre-loaded per worker (default: 2)")
     args = parser.parse_args()
 
     batch_size   = args.batch_size
@@ -457,11 +459,13 @@ def main():
         train_ds, batch_size=batch_size,
         collate_fn=collate_fn, drop_last=True,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size,
         collate_fn=collate_fn, drop_last=False,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
     )
 
     mem1 = mem_rss_mb()
