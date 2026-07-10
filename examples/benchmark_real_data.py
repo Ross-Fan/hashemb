@@ -150,16 +150,10 @@ class StreamingParquetDataset(torch.utils.data.IterableDataset):
     Designed for datasets too large to fit in memory (e.g. 100M+ records).
     Reads Parquet files in configurable row-group-sized chunks using
     ``pq.ParquetFile.iter_batches()``.
-
-    Train/val split is at the file level: the first ``val_split`` fraction
-    of sorted files is reserved for validation.
     """
 
-    def __init__(self, file_patterns, max_records=0, split="train",
-                 val_split=0.1, seed=42, parquet_batch_size=65536):
-        if split not in ("train", "val"):
-            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
-
+    def __init__(self, file_patterns, max_records=0, seed=42,
+                 parquet_batch_size=65536):
         files = []
         for pattern in file_patterns:
             matched = glob.glob(pattern)
@@ -169,20 +163,12 @@ class StreamingParquetDataset(torch.utils.data.IterableDataset):
                 f"No Parquet files found for patterns: {file_patterns}")
         files.sort()
 
-        # File-level train/val split
-        n_val_files = max(1, int(len(files) * val_split))
-        if n_val_files >= len(files):
-            n_val_files = max(1, len(files) - 1)
-        if split == "train":
-            self._files = files[n_val_files:]
-        else:
-            self._files = files[:n_val_files]
-
+        self._files = files
         self._max_records = max_records
         self._seed = seed
         self._parquet_batch_size = parquet_batch_size
         self._epoch = 0
-        self.n_files = len(self._files)
+        self.n_files = len(files)
 
     def set_epoch(self, epoch):
         """Set current epoch (controls shuffle seed). Call before each epoch."""
@@ -353,6 +339,9 @@ def main():
         description="HashEmb stability test with real Parquet data")
     parser.add_argument("--data", nargs="+", required=True,
                         help="Parquet file pattern(s), e.g. 'data/*.parquet'")
+    parser.add_argument("--val-data", nargs="+", default=None,
+                        help="Separate validation Parquet file pattern(s) "
+                             "(default: no validation)")
     parser.add_argument("--max-records", type=int, default=MAX_RECORDS,
                         help="Max records to load per epoch (0 = unlimited)")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
@@ -364,8 +353,6 @@ def main():
     parser.add_argument("--capacity", type=int, default=HASH_CAPACITY)
     parser.add_argument("--block-size", type=int, default=BLOCK_SIZE)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--val-split", type=float, default=0.1,
-                        help="Fraction of files held out for validation")
     parser.add_argument("--stats-samples", type=int, default=10000,
                         help="Records to sample for stats estimation")
     parser.add_argument("--parquet-batch-size", type=int, default=65536,
@@ -376,6 +363,10 @@ def main():
                         help="DataLoader workers for prefetch (0=main process only)")
     parser.add_argument("--prefetch-factor", type=int, default=2,
                         help="Batches pre-loaded per worker (default: 2)")
+    parser.add_argument("--save", type=str, default=None,
+                        help="Save checkpoint to this path after training")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Load checkpoint from this path before training")
     args = parser.parse_args()
 
     batch_size   = args.batch_size
@@ -385,7 +376,6 @@ def main():
     lr           = args.lr
     capacity     = args.capacity
     block_size   = args.block_size
-    val_split    = args.val_split
 
     # =========================================================================
     # Header
@@ -409,7 +399,14 @@ def main():
     print(f"  Epochs:                {epochs if not duration else 'until timeout'}")
     if duration:
         print(f"  Duration limit:        {duration}s")
-    print(f"  Val split:             {val_split:.0%} (file-level)")
+    if args.val_data:
+        print(f"  Validation data:       {args.val_data}")
+    else:
+        print(f"  Validation:            SKIP (no --val-data)")
+    if args.resume:
+        print(f"  Resume from:           {args.resume}")
+    if args.save:
+        print(f"  Save to:               {args.save}")
     print(f"  Debug:                 {args.debug}")
     print()
 
@@ -439,21 +436,10 @@ def main():
     train_ds = StreamingParquetDataset(
         args.data,
         max_records=max_records,
-        split="train",
-        val_split=val_split,
         seed=SEED,
         parquet_batch_size=args.parquet_batch_size,
     )
-    val_ds = StreamingParquetDataset(
-        args.data,
-        max_records=max_records,
-        split="val",
-        val_split=val_split,
-        seed=SEED,
-        parquet_batch_size=args.parquet_batch_size,
-    )
-
-    print(f"  Train files: {train_ds.n_files}  Val files: {val_ds.n_files}")
+    print(f"  Train files: {train_ds.n_files}")
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,
@@ -461,12 +447,23 @@ def main():
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size,
-        collate_fn=collate_fn, drop_last=False,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
+
+    val_loader = None
+    if args.val_data:
+        val_ds = StreamingParquetDataset(
+            args.val_data,
+            max_records=max_records,
+            seed=SEED,
+            parquet_batch_size=args.parquet_batch_size,
+        )
+        print(f"  Val files:   {val_ds.n_files}")
+
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size,
+            collate_fn=collate_fn, drop_last=False,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
 
     mem1 = mem_rss_mb()
     if ds_stats:
@@ -487,6 +484,18 @@ def main():
 
     model = RealDataModel(EMBEDDING_DIM, capacity, lr, block_size)
     opt = torch.optim.Adam(model.predict.parameters(), lr=lr)
+
+    # ── Resume from checkpoint ──
+    resume_epoch = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location="cpu")
+        model.emb.load_state_dict(ckpt["hash_emb"])
+        model.predict.load_state_dict(ckpt["dense"])
+        opt.load_state_dict(ckpt["opt"])
+        resume_epoch = ckpt.get("epoch", 0)
+        print(f"  [RESUME] Loaded checkpoint from {args.resume}")
+        print(f"           prev_epoch={resume_epoch}  "
+              f"entries={model.emb.num_entries:,}")
 
     mem3 = mem_rss_mb()
     print(f"  Initial entries: {model.emb.num_entries:,}")
@@ -622,20 +631,23 @@ def main():
                 int_t_start = time.perf_counter()
 
         # ── Validation ──
-        model.eval()
-        all_scores, all_labels_gt = [], []
-        with torch.no_grad():
-            for batch_ids, labels in val_loader:
-                logits = model(batch_ids)
-                all_scores.append(torch.sigmoid(logits).numpy())
-                all_labels_gt.append(labels.numpy())
+        if val_loader is not None:
+            model.eval()
+            all_scores, all_labels_gt = [], []
+            with torch.no_grad():
+                for batch_ids, labels in val_loader:
+                    logits = model(batch_ids)
+                    all_scores.append(torch.sigmoid(logits).numpy())
+                    all_labels_gt.append(labels.numpy())
 
-        try:
-            auc = roc_auc_score(
-                np.concatenate(all_labels_gt),
-                np.concatenate(all_scores))
-        except ValueError:
-            auc = 0.5
+            try:
+                auc = roc_auc_score(
+                    np.concatenate(all_labels_gt),
+                    np.concatenate(all_scores))
+            except ValueError:
+                auc = 0.5
+        else:
+            auc = float("nan")
 
         # ── Metrics ──
         n_ent      = model.emb.num_entries
@@ -659,7 +671,8 @@ def main():
         snap_auc.append((epoch, auc))
 
         avg_loss = ep_loss / max(n_batches_this_epoch, 1)
-        print(f"{epoch:4d} | {avg_loss:7.4f} {auc:7.4f} | "
+        auc_str = f"{auc:7.4f}" if not np.isnan(auc) else "     --"
+        print(f"{epoch:4d} | {avg_loss:7.4f} {auc_str:>7s} | "
               f"{n_ent:10,d} {cur_mem:8.0f} {mem_delta:+6.0f} | "
               f"{avg_fwd:6.1f} {avg_bwd:6.1f} {avg_step:6.1f} {avg_tot:6.1f} | "
               f"{tput:9.1f}")
@@ -678,6 +691,18 @@ def main():
         prev_ent = n_ent
 
     total_time = time.time() - wall_start
+
+    # ── Save checkpoint ──
+    if args.save:
+        checkpoint = {
+            "hash_emb": model.emb.state_dict(),
+            "dense": model.predict.state_dict(),
+            "opt": opt.state_dict(),
+            "epoch": epoch,
+        }
+        torch.save(checkpoint, args.save)
+        print(f"\n  [SAVE] Checkpoint saved to {args.save}")
+        print(f"         epoch={epoch}  entries={model.emb.num_entries:,}")
 
     # =========================================================================
     # Summary
@@ -734,10 +759,11 @@ def main():
 
     # ── AUC ──
     if snap_auc:
-        aucs = [a for _, a in snap_auc]
-        print(f"AUC:  start={aucs[0]:.4f}  best={max(aucs):.4f}  "
-              f"final={aucs[-1]:.4f}  "
-              f"{'up' if aucs[-1] > aucs[0] else 'down' if aucs[-1] < aucs[0] else '--'}")
+        aucs = [a for _, a in snap_auc if not np.isnan(a)]
+        if aucs:
+            print(f"AUC:  start={aucs[0]:.4f}  best={max(aucs):.4f}  "
+                  f"final={aucs[-1]:.4f}  "
+                  f"{'up' if aucs[-1] > aucs[0] else 'down' if aucs[-1] < aucs[0] else '--'}")
         print()
 
     # ── Weight sanity ──
