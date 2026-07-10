@@ -16,7 +16,7 @@ Dependencies:
     pip install pyarrow  # for Parquet reading
 
 Usage:
-    # Default: read up to 2M records, train 100 epochs, streaming from Parquet
+    # Default: read up to 2M records, 1 epoch (single pass through data)
     python examples/benchmark_real_data.py --data "/path/to/*.parquet"
 
     # Long stability test
@@ -85,7 +85,7 @@ MAX_FEATS     = N_DISCRETE + sum(SEQ_MAX_LENS.values())      # 63 + 170 = 233
 EMBEDDING_DIM   = 16
 BATCH_SIZE      = 4096
 MAX_RECORDS     = 2_000_000
-EPOCHS          = 100
+EPOCHS          = 1
 LR              = 0.01
 HASH_CAPACITY   = 10_000_000
 BLOCK_SIZE      = 1_000_000

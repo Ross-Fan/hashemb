@@ -35,7 +35,7 @@ PYTHON_SCRIPT="$SCRIPT_DIR/benchmark_real_data.py"
 # ── Default hyperparams (override with CLI) ──
 BATCH_SIZE=4096
 MAX_RECORDS=0          # 0 = all records
-STEPS=3                # epochs per day
+STEPS=1                # epochs per day
 LR=0.01
 EMBEDDING_DIM=16
 CAPACITY=20_000_000
