@@ -143,13 +143,21 @@ class HashEmbedding(torch.nn.Module):
 
     # ── Checkpoint ─────────────────────────────────────────────────────
 
-    def save(self, path: str):
+    def save(self, path: str, min_count: int = 0,
+             max_idle_steps: int = 0, combine: str = ""):
         """Save hash table to binary file (bucket-by-bucket, zero extra memory).
+
+        Optionally evict stale keys during save via hard-rule filtering.
 
         Args:
             path: File path to write.
+            min_count: Evict keys whose update_count < min_count (0=disabled).
+            max_idle_steps: Evict keys idle for more than max_idle_steps (0=disabled).
+            combine: When both min_count and max_idle_steps > 0, "and" evicts
+                     only if BOTH conditions trigger, "or" evicts if EITHER
+                     condition triggers.  Default "and" (conservative).
         """
-        self._table.save(path)
+        self._table.save(path, min_count, max_idle_steps, combine)
 
     def load(self, path: str):
         """Load hash table from binary file written by :meth:`save`.

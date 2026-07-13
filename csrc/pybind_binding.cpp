@@ -100,7 +100,12 @@ class PyHashEmbedding {
 
   // ── Binary save / load ────────────────────────────────────────
 
-  void save(const std::string& path) const { table_.save(path); }
+  void save(const std::string& path,
+            uint32_t min_count = 0,
+            uint32_t max_idle_steps = 0,
+            const std::string& combine = "") const {
+    table_.save(path, min_count, max_idle_steps, combine);
+  }
   void load(const std::string& path) { table_.load(path); }
 
   // ── Serialisation ───────────────────────────────────────────────────
@@ -217,7 +222,11 @@ PYBIND11_MODULE(_hashemb_cpp, m) {
            py::arg("state_dict"))
 
       // Binary save/load (bucket-by-bucket, zero extra memory)
-      .def("save", &hashemb::PyHashEmbedding::save, py::arg("path"))
+      .def("save", &hashemb::PyHashEmbedding::save,
+           py::arg("path"),
+           py::arg("min_count") = 0,
+           py::arg("max_idle_steps") = 0,
+           py::arg("combine") = "")
       .def("load", &hashemb::PyHashEmbedding::load, py::arg("path"))
 
       // Properties

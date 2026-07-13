@@ -45,6 +45,13 @@ struct Block {
   }
 };
 
+/// Per-slot eviction stats stored alongside embedding/grad/m/v blocks.
+/// 8 bytes per slot, allocated in block_size_-sized chunks.
+struct SlotStats {
+  uint32_t update_count;   // cumulative times this key was updated by step()
+  uint32_t last_step;      // global_step_ when last updated
+};
+
 /// Get pointer to slot `slot_id` within a block vector using given block_size.
 inline float* slot_ptr(const std::vector<Block>& blocks, int64_t slot_id, int32_t D, int64_t block_size) {
   int64_t block_id = slot_id / block_size;
@@ -60,12 +67,13 @@ inline float* slot_ptr(const std::vector<Block>& blocks, int64_t slot_id, int32_
 ///   grad_blocks_  [n_blocks][block_size, D]  ← accumulated gradients
 ///   m_blocks_     [n_blocks][block_size, D]  ← Adam 1st moment (ADAM only)
 ///   v_blocks_     [n_blocks][block_size, D]  ← Adam 2nd moment (ADAM only)
+///   stats_blocks_ [n_blocks][block_size][SlotStats]  ← eviction metadata
 ///   t_                                       ← Adam timestep
 ///
 /// Data flow:
 ///   scatter_add_grad(slots, grads)    — called by backward(), accumulates into grad_blocks_
-///   step()                           — applies grad via SGD/Adam, then zeroes grad
-///   zero_grad()                      — clears grad_blocks_
+///   step()                            — applies grad via SGD/Adam, updates stats, then zeroes grad
+///   zero_grad()                       — clears grad_blocks_
 class EmbeddingTable {
  public:
   EmbeddingTable(int64_t initial_capacity, int32_t embedding_dim,
@@ -101,9 +109,19 @@ class EmbeddingTable {
   // ── Serialisation ───────────────────────────────────────────────────
 
   /// Save to binary file (bucket-by-bucket, zero extra memory allocation).
-  void save(const std::string& path) const;
+  ///
+  /// Eviction parameters (default: 0 = disabled):
+  ///   min_count       — keep only keys with update_count >= min_count
+  ///   max_idle_steps  — keep only keys idle for <= max_idle_steps
+  ///   combine         — "and" (both must trigger) or "or" (either triggers)
+  ///                      Only relevant when both min_count and max_idle_steps > 0.
+  void save(const std::string& path,
+            uint32_t min_count = 0,
+            uint32_t max_idle_steps = 0,
+            const std::string& combine = "") const;
 
   /// Load from binary file written by save().
+  /// Supports VERSION=0 (no stats) and VERSION=1 (with stats).
   void load(const std::string& path);
 
   /// state_dict fields (pybind11 bridge expects numpy-compatible layout):
@@ -160,6 +178,10 @@ class EmbeddingTable {
   std::vector<Block> m_blocks_;
   std::vector<Block> v_blocks_;
   int64_t t_ = 0;
+
+  // Eviction stats (allocated on demand via ensure_slot, same block_size_)
+  std::vector<Block> stats_blocks_;
+  int64_t global_step_ = 0;
 
   // Dirty-slot tracking for sparse step().
   // scatter_add_grad marks slots as dirty; step() only iterates dirty_slots_.

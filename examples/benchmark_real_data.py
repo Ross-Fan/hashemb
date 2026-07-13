@@ -31,6 +31,7 @@ Usage:
 
 import argparse
 import glob
+import os
 import resource
 import sys
 import time
@@ -367,6 +368,13 @@ def main():
                         help="Save checkpoint to this path after training")
     parser.add_argument("--resume", type=str, default=None,
                         help="Load checkpoint from this path before training")
+    parser.add_argument("--evict-min-count", type=int, default=0,
+                        help="Evict keys with update_count < N (0=disabled)")
+    parser.add_argument("--evict-max-idle-days", type=int, default=0,
+                        help="Evict keys idle for > N days (0=disabled)")
+    parser.add_argument("--evict-combine", type=str, default="and",
+                        choices=["and", "or", ""],
+                        help="Eviction combination logic (default: and)")
     args = parser.parse_args()
 
     batch_size   = args.batch_size
@@ -486,16 +494,23 @@ def main():
     opt = torch.optim.Adam(model.predict.parameters(), lr=lr)
 
     # ── Resume from checkpoint ──
+    # HashEmb uses C++ binary save/load (bucket-by-bucket, zero extra memory).
+    # Dense model + optimizer use torch.save/load (.pt, tens of MB).
     resume_epoch = 0
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
-        model.emb.load_state_dict(ckpt["hash_emb"])
-        model.predict.load_state_dict(ckpt["dense"])
-        opt.load_state_dict(ckpt["opt"])
-        resume_epoch = ckpt.get("epoch", 0)
-        print(f"  [RESUME] Loaded checkpoint from {args.resume}")
-        print(f"           prev_epoch={resume_epoch}  "
-              f"entries={model.emb.num_entries:,}")
+        binary_path = args.resume.replace('.pt', '.hashemb')
+        if os.path.exists(binary_path):
+            model.emb.load(binary_path)
+            ckpt = torch.load(args.resume, map_location="cpu", weights_only=True)
+            model.predict.load_state_dict(ckpt["dense"])
+            opt.load_state_dict(ckpt["opt"])
+            resume_epoch = ckpt.get("epoch", 0)
+            print(f"  [RESUME] Hash table from {os.path.basename(binary_path)}")
+            print(f"           Dense model from {os.path.basename(args.resume)}")
+            print(f"           prev_epoch={resume_epoch}  "
+                  f"entries={model.emb.num_entries:,}")
+        else:
+            print(f"  [RESUME] {binary_path} not found, cold start")
 
     mem3 = mem_rss_mb()
     print(f"  Initial entries: {model.emb.num_entries:,}")
@@ -693,15 +708,28 @@ def main():
     total_time = time.time() - wall_start
 
     # ── Save checkpoint ──
+    # HashEmb → C++ binary (bucket-by-bucket, zero extra memory).
+    # Dense + optimizer → torch.save (tens of MB).
     if args.save:
-        checkpoint = {
-            "hash_emb": model.emb.state_dict(),
+        binary_path = args.save.replace('.pt', '.hashemb')
+        max_idle_steps = args.evict_max_idle_days * (n_batches or 0) if args.evict_max_idle_days > 0 else 0
+        model.emb.save(binary_path,
+                       min_count=args.evict_min_count,
+                       max_idle_steps=max_idle_steps,
+                       combine=args.evict_combine)
+        dense_ckpt = {
             "dense": model.predict.state_dict(),
             "opt": opt.state_dict(),
             "epoch": epoch,
         }
-        torch.save(checkpoint, args.save)
-        print(f"\n  [SAVE] Checkpoint saved to {args.save}")
+        torch.save(dense_ckpt, args.save)
+        print(f"\n  [SAVE] Hash table → {binary_path}")
+        print(f"         Dense model → {args.save}")
+        if args.evict_min_count > 0 or args.evict_max_idle_days > 0:
+            print(f"         Eviction: min_count={args.evict_min_count}"
+                  f" max_idle_steps={max_idle_steps}"
+                  f" ({args.evict_max_idle_days}d)"
+                  f" combine={args.evict_combine}")
         print(f"         epoch={epoch}  entries={model.emb.num_entries:,}")
 
     # =========================================================================

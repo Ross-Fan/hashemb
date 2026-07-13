@@ -138,6 +138,24 @@ class ThreadPool {
   size_t total_ = 0;
 };
 
+/// Helper: access SlotStats for a given slot within stats_blocks_.
+/// block_stride = sizeof(SlotStats) / sizeof(float) = 2.
+static constexpr int32_t kStatsStride = 2;
+
+inline SlotStats* stats_ptr(const std::vector<Block>& blocks,
+                             int64_t slot_id, int64_t block_size) {
+  int64_t block_id = slot_id / block_size;
+  int64_t offset = slot_id % block_size;
+  return reinterpret_cast<SlotStats*>(blocks[block_id].data) + offset;
+}
+
+inline const SlotStats* stats_ptr_const(const std::vector<Block>& blocks,
+                                         int64_t slot_id, int64_t block_size) {
+  int64_t block_id = slot_id / block_size;
+  int64_t offset = slot_id % block_size;
+  return reinterpret_cast<const SlotStats*>(blocks[block_id].data) + offset;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -166,6 +184,7 @@ EmbeddingTable::~EmbeddingTable() {
   for (auto& b : grad_blocks_) b.deallocate();
   for (auto& b : m_blocks_) b.deallocate();
   for (auto& b : v_blocks_) b.deallocate();
+  for (auto& b : stats_blocks_) b.deallocate();
 }
 
 // ===========================================================================
@@ -186,6 +205,11 @@ void EmbeddingTable::ensure_slot(int64_t slot_id) {
       v_blocks_.emplace_back();
       v_blocks_.back().allocate(block_size_, embedding_dim_);
     }
+    // Stats block: block_size_ slots × sizeof(SlotStats) = block_size_ × 8 bytes.
+    // allocate(dim=kStatsStride) → block_size_ × 2 × 4 = block_size_ × 8 bytes.
+    stats_blocks_.emplace_back();
+    stats_blocks_.back().allocate(block_size_, kStatsStride);
+
     // Randomly initialize embedding weights if initial_scale > 0.
     // Uses Box-Muller transform to produce normal(0, initial_scale)
     // distribution, matching nn.init.normal_(std=initial_scale).
@@ -363,6 +387,21 @@ void EmbeddingTable::step() {
     });
   }
 
+  // ── Update eviction stats for all dirty slots ─────────────────
+  // Must be done BEFORE dirty_slots_.clear().
+  // Single-threaded (no contention), cost is O(ndirty × 1).
+  {
+    const int32_t* slots = dirty_slots_.data();
+    int64_t next_step = global_step_ + 1;
+    for (size_t di = 0; di < ndirty; ++di) {
+      int32_t slot = slots[di];
+      auto* st = stats_ptr(stats_blocks_, slot, bs);
+      st->update_count++;
+      st->last_step = static_cast<uint32_t>(next_step);
+    }
+    global_step_ = next_step;
+  }
+
   dirty_slots_.clear();
   // Note: gradients zeroed in-place above — no separate zero_grad() call needed.
 }
@@ -455,8 +494,14 @@ void EmbeddingTable::load_state_dict_arrays(
 // ===========================================================================
 // Binary save / load (bucket-by-bucket, zero extra memory allocation)
 // ===========================================================================
+// VERSION=0: original format, no eviction stats.
+// VERSION=1: per-entry SlotStats (update_count + last_step) in each bucket section.
+//             Header includes global_step.  Eviction filtering applied during write.
 
-void EmbeddingTable::save(const std::string& path) const {
+void EmbeddingTable::save(const std::string& path,
+                          uint32_t min_count,
+                          uint32_t max_idle_steps,
+                          const std::string& combine) const {
   FILE* fp = std::fopen(path.c_str(), "wb");
   if (!fp) throw std::runtime_error("Cannot open " + path + " for writing");
 
@@ -464,14 +509,34 @@ void EmbeddingTable::save(const std::string& path) const {
   int64_t bs = block_size_;
   int64_t n_total = hash_table_.num_entries();
   bool is_adam = (opt_cfg_.type == OptimizerConfig::ADAM);
+  bool has_filter = (min_count > 0 || max_idle_steps > 0);
+
+  // ── Eviction predicate (lazy evaluation) ─────────────────────
+  // Only evaluated when has_filter is true.
+  auto should_keep = [&](int32_t slot) -> bool {
+    const auto* st = stats_ptr_const(stats_blocks_, slot, bs);
+    uint32_t idle = static_cast<uint32_t>(global_step_) - st->last_step;
+
+    bool cond_a = (min_count > 0) && (st->update_count < min_count);
+    bool cond_b = (max_idle_steps > 0) && (idle > max_idle_steps);
+
+    if (min_count > 0 && max_idle_steps > 0) {
+      if (combine == "or")  return !(cond_a || cond_b);
+      if (combine == "and") return !(cond_a && cond_b);
+      // Default: "and" (conservative — keep unless both conditions trigger)
+      return !(cond_a && cond_b);
+    }
+    if (min_count > 0)       return !cond_a;
+    if (max_idle_steps > 0)  return !cond_b;
+    return true;  // no filter, keep all
+  };
 
   // ── Header ─────────────────────────────────────────────────────
-  // magic (8 bytes) + version (int32)
   std::fwrite("HASHEMB", 1, 8, fp);
-  int32_t version = 0;
+  int32_t version = 1;
   std::fwrite(&version, sizeof(version), 1, fp);
 
-  // num_entries, dim, opt_type (padded to 8 bytes)
+  // num_entries (before filtering — informational), dim, opt_type
   std::fwrite(&n_total, sizeof(n_total), 1, fp);
   std::fwrite(&D, sizeof(D), 1, fp);
   char opt_buf[8] = {};
@@ -485,24 +550,40 @@ void EmbeddingTable::save(const std::string& path) const {
   std::fwrite(&opt_cfg_.eps,    sizeof(float), 1, fp);
   std::fwrite(&t_, sizeof(t_), 1, fp);
   std::fwrite(&bs,  sizeof(bs), 1, fp);
+  std::fwrite(&global_step_, sizeof(global_step_), 1, fp);
 
   // ── Bucket sections ────────────────────────────────────────────
-  // Each bucket: n_entries(int64) + bucket_id(int32)
-  //   then n_entries × [key(int64) + slot(int32) + weight(float[D])
-  //                     + grad(float[D]) + m(float[D]) + v(float[D])]
+  // VERSION=1 per-bucket format:
+  //   nb_eligible(int64) + bucket_id(int32)
+  //   then nb_eligible × [key(int64) + update_count(uint32) + last_step(uint32)
+  //                        + weight(float[D]) + grad(float[D]) + m(float[D]) + v(float[D])]
   for (int b = 0; b < kNumBuckets; ++b) {
     auto entries = hash_table_.dump_bucket(b);
-    int64_t nb = static_cast<int64_t>(entries.size());
+
+    // Count eligible entries for this bucket.
+    int64_t nb = 0;
+    if (has_filter) {
+      for (const auto& e : entries) {
+        if (should_keep(e.second)) ++nb;
+      }
+    } else {
+      nb = static_cast<int64_t>(entries.size());
+    }
+
     std::fwrite(&nb, sizeof(nb), 1, fp);
     int32_t bid = b;
     std::fwrite(&bid, sizeof(bid), 1, fp);
 
     for (const auto& e : entries) {
-      int64_t key = e.first;
       int32_t slot = e.second;
+      if (has_filter && !should_keep(slot)) continue;
 
-      std::fwrite(&key,  sizeof(key),  1, fp);
-      std::fwrite(&slot, sizeof(slot), 1, fp);
+      int64_t key = e.first;
+      const auto* st = stats_ptr_const(stats_blocks_, slot, bs);
+
+      std::fwrite(&key,             sizeof(key),            1, fp);
+      std::fwrite(&st->update_count, sizeof(st->update_count), 1, fp);
+      std::fwrite(&st->last_step,   sizeof(st->last_step),  1, fp);
       std::fwrite(slot_ptr(emb_blocks_, slot, D, bs), sizeof(float), D, fp);
       std::fwrite(slot_ptr(grad_blocks_, slot, D, bs), sizeof(float), D, fp);
       if (is_adam) {
@@ -529,7 +610,6 @@ void EmbeddingTable::load(const std::string& path) {
 
   int32_t version;
   std::fread(&version, sizeof(version), 1, fp);
-  (void)version;  // reserved for future format versions
 
   int64_t file_n;
   int32_t file_D;
@@ -568,14 +648,16 @@ void EmbeddingTable::load(const std::string& path) {
   }
   t_ = file_t;
 
+  // VERSION=1: restore global_step_
+  if (version >= 1) {
+    std::fread(&global_step_, sizeof(global_step_), 1, fp);
+  }
+
   int32_t D = embedding_dim_;
   int64_t bs = block_size_;
   bool is_adam = (opt_cfg_.type == OptimizerConfig::ADAM);
 
   // ── Bucket sections ────────────────────────────────────────────
-  // For each entry: read key, insert via find_or_create to get the
-  // correct slot for the current table state, then read weight/grad/m/v
-  // directly into the block buffer (zero extra allocation).
   for (int b = 0; b < kNumBuckets; ++b) {
     int64_t nb;
     int32_t bid;
@@ -584,21 +666,49 @@ void EmbeddingTable::load(const std::string& path) {
 
     for (int64_t i = 0; i < nb; ++i) {
       int64_t key;
-      int32_t saved_slot;  // saved slot ID (informational, not used)
-      std::fread(&key,        sizeof(key),        1, fp);
-      std::fread(&saved_slot, sizeof(saved_slot), 1, fp);
 
-      // Insert key into hash table → get current slot.
-      int32_t slot;
-      hash_table_.find_or_create(&key, &slot, 1);
-      ensure_slot(slot);
+      if (version >= 1) {
+        uint32_t saved_count, saved_last_step;
+        std::fread(&key,              sizeof(key),              1, fp);
+        std::fread(&saved_count,      sizeof(saved_count),      1, fp);
+        std::fread(&saved_last_step,  sizeof(saved_last_step),  1, fp);
 
-      // Read data directly into block buffer (zero-copy from disk).
-      std::fread(slot_ptr(emb_blocks_, slot, D, bs),   sizeof(float), D, fp);
-      std::fread(slot_ptr(grad_blocks_, slot, D, bs),  sizeof(float), D, fp);
-      if (is_adam) {
-        std::fread(slot_ptr(m_blocks_, slot, D, bs),   sizeof(float), D, fp);
-        std::fread(slot_ptr(v_blocks_, slot, D, bs),   sizeof(float), D, fp);
+        // Insert key into hash table → get new slot.
+        int32_t slot;
+        hash_table_.find_or_create(&key, &slot, 1);
+        ensure_slot(slot);
+
+        // Restore stats into stats block.
+        auto* st = stats_ptr(stats_blocks_, slot, bs);
+        st->update_count = saved_count;
+        st->last_step    = saved_last_step;
+
+        // Read embeddings directly into block buffer.
+        std::fread(slot_ptr(emb_blocks_, slot, D, bs),  sizeof(float), D, fp);
+        std::fread(slot_ptr(grad_blocks_, slot, D, bs), sizeof(float), D, fp);
+        if (is_adam) {
+          std::fread(slot_ptr(m_blocks_, slot, D, bs), sizeof(float), D, fp);
+          std::fread(slot_ptr(v_blocks_, slot, D, bs), sizeof(float), D, fp);
+        }
+      } else {
+        // VERSION=0: original format (no stats).
+        int32_t saved_slot;
+        std::fread(&key,        sizeof(key),        1, fp);
+        std::fread(&saved_slot, sizeof(saved_slot), 1, fp);
+
+        int32_t slot;
+        hash_table_.find_or_create(&key, &slot, 1);
+        ensure_slot(slot);
+
+        // Stats are zero-initialized by ensure_slot → count=0, last_step=0.
+        // This is correct: keys from an old checkpoint start with no history.
+
+        std::fread(slot_ptr(emb_blocks_, slot, D, bs),  sizeof(float), D, fp);
+        std::fread(slot_ptr(grad_blocks_, slot, D, bs), sizeof(float), D, fp);
+        if (is_adam) {
+          std::fread(slot_ptr(m_blocks_, slot, D, bs), sizeof(float), D, fp);
+          std::fread(slot_ptr(v_blocks_, slot, D, bs), sizeof(float), D, fp);
+        }
       }
     }
   }
