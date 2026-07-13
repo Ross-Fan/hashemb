@@ -500,12 +500,15 @@ def main():
     if args.resume:
         binary_path = args.resume.replace('.pt', '.hashemb')
         if os.path.exists(binary_path):
+            t_load = time.time()
             model.emb.load(binary_path)
+            dt_load = time.time() - t_load
             ckpt = torch.load(args.resume, map_location="cpu", weights_only=True)
             model.predict.load_state_dict(ckpt["dense"])
             opt.load_state_dict(ckpt["opt"])
             resume_epoch = ckpt.get("epoch", 0)
-            print(f"  [RESUME] Hash table from {os.path.basename(binary_path)}")
+            print(f"  [RESUME] Hash table from {os.path.basename(binary_path)}"
+                  f"  ({dt_load:.1f}s)")
             print(f"           Dense model from {os.path.basename(args.resume)}")
             print(f"           prev_epoch={resume_epoch}  "
                   f"entries={model.emb.num_entries:,}")

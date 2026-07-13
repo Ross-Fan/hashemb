@@ -540,7 +540,7 @@ int64_t EmbeddingTable::save(const std::string& path,
 
   // ── Header ─────────────────────────────────────────────────────
   std::fwrite("HASHEMB", 1, 8, fp);
-  int32_t version = 1;
+  int32_t version = 2;
   std::fwrite(&version, sizeof(version), 1, fp);
 
   // num_entries (before filtering — informational), dim, opt_type
@@ -561,15 +561,11 @@ int64_t EmbeddingTable::save(const std::string& path,
 
   int64_t total_written = 0;
 
-  // ── Bucket sections ────────────────────────────────────────────
-  // VERSION=1 per-bucket format:
-  //   nb_eligible(int64) + bucket_id(int32)
-  //   then nb_eligible × [key(int64) + update_count(uint32) + last_step(uint32)
-  //                        + weight(float[D]) + grad(float[D]) + m(float[D]) + v(float[D])]
+  // ── Bucket files (VERSION=2: one file per bucket) ─────────────
+  // Per-bucket file: [nb: int64][bid: int32] + nb entries.
   for (int b = 0; b < kNumBuckets; ++b) {
     auto entries = hash_table_.dump_bucket(b);
 
-    // Count eligible entries for this bucket.
     int64_t nb = 0;
     if (has_filter) {
       for (const auto& e : entries) {
@@ -578,11 +574,17 @@ int64_t EmbeddingTable::save(const std::string& path,
     } else {
       nb = static_cast<int64_t>(entries.size());
     }
-
-    std::fwrite(&nb, sizeof(nb), 1, fp);
     total_written += nb;
+
+    char bucket_path[2048];
+    std::snprintf(bucket_path, sizeof(bucket_path), "%s_bucket_%02d",
+                  path.c_str(), b);
+    FILE* bfp = std::fopen(bucket_path, "wb");
+    if (!bfp) throw std::runtime_error("Cannot open " + std::string(bucket_path) + " for writing");
+
+    std::fwrite(&nb, sizeof(nb), 1, bfp);
     int32_t bid = b;
-    std::fwrite(&bid, sizeof(bid), 1, fp);
+    std::fwrite(&bid, sizeof(bid), 1, bfp);
 
     for (const auto& e : entries) {
       int32_t slot = e.second;
@@ -591,16 +593,17 @@ int64_t EmbeddingTable::save(const std::string& path,
       int64_t key = e.first;
       const auto* st = stats_ptr_const(stats_blocks_, slot, bs);
 
-      std::fwrite(&key,             sizeof(key),            1, fp);
-      std::fwrite(&st->update_count, sizeof(st->update_count), 1, fp);
-      std::fwrite(&st->last_step,   sizeof(st->last_step),  1, fp);
-      std::fwrite(slot_ptr(emb_blocks_, slot, D, bs), sizeof(float), D, fp);
-      std::fwrite(slot_ptr(grad_blocks_, slot, D, bs), sizeof(float), D, fp);
+      std::fwrite(&key,              sizeof(key),             1, bfp);
+      std::fwrite(&st->update_count, sizeof(st->update_count),  1, bfp);
+      std::fwrite(&st->last_step,    sizeof(st->last_step),     1, bfp);
+      std::fwrite(slot_ptr(emb_blocks_, slot, D, bs),  sizeof(float), D, bfp);
+      std::fwrite(slot_ptr(grad_blocks_, slot, D, bs), sizeof(float), D, bfp);
       if (is_adam) {
-        std::fwrite(slot_ptr(m_blocks_, slot, D, bs), sizeof(float), D, fp);
-        std::fwrite(slot_ptr(v_blocks_, slot, D, bs), sizeof(float), D, fp);
+        std::fwrite(slot_ptr(m_blocks_, slot, D, bs), sizeof(float), D, bfp);
+        std::fwrite(slot_ptr(v_blocks_, slot, D, bs), sizeof(float), D, bfp);
       }
     }
+    std::fclose(bfp);
   }
 
   std::fclose(fp);
@@ -670,63 +673,132 @@ void EmbeddingTable::load(const std::string& path) {
 
   int64_t total_written = 0;
 
-  // ── Bucket sections ────────────────────────────────────────────
-  for (int b = 0; b < kNumBuckets; ++b) {
-    int64_t nb;
-    int32_t bid;
-    std::fread(&nb,  sizeof(nb),  1, fp);
-    std::fread(&bid, sizeof(bid), 1, fp);
+  // ── Load bucket data ──────────────────────────────────────────
+  if (version >= 2) {
+    // Multi-file format: each bucket in a separate .hashemb_bucket_XX file.
+    // Read entire file, then parse in memory — no byte-size math needed.
+    std::fclose(fp);
+    std::vector<char> buf;
 
-    for (int64_t i = 0; i < nb; ++i) {
-      int64_t key;
+    for (int b = 0; b < kNumBuckets; ++b) {
+      char bucket_path[2048];
+      std::snprintf(bucket_path, sizeof(bucket_path), "%s_bucket_%02d",
+                    path.c_str(), b);
+      FILE* bfp = std::fopen(bucket_path, "rb");
+      if (!bfp) throw std::runtime_error("Cannot open " + std::string(bucket_path) + " for reading");
 
-      if (version >= 1) {
+      // Read entire bucket file
+      std::fseek(bfp, 0, SEEK_END);
+      long fsize = std::ftell(bfp);
+      if (fsize <= 0) { std::fclose(bfp); continue; }
+      std::rewind(bfp);
+      buf.resize(static_cast<size_t>(fsize));
+      std::fread(buf.data(), 1, static_cast<size_t>(fsize), bfp);
+      std::fclose(bfp);
+
+      const char* p = buf.data();
+      int64_t nb; int32_t bid;
+      std::memcpy(&nb,  p, 8);  p += 8;
+      std::memcpy(&bid, p, 4);  p += 4;
+      total_written += nb;
+
+      for (int64_t i = 0; i < nb; ++i) {
+        int64_t key;
         uint32_t saved_count, saved_last_step;
-        std::fread(&key,              sizeof(key),              1, fp);
-        std::fread(&saved_count,      sizeof(saved_count),      1, fp);
-        std::fread(&saved_last_step,  sizeof(saved_last_step),  1, fp);
+        std::memcpy(&key,              p, 8);  p += 8;
+        std::memcpy(&saved_count,      p, 4);  p += 4;
+        std::memcpy(&saved_last_step,  p, 4);  p += 4;
 
-        // Insert key into hash table → get new slot.
         int32_t slot;
         hash_table_.find_or_create(&key, &slot, 1);
         ensure_slot(slot);
 
-        // Restore stats into stats block.
         auto* st = stats_ptr(stats_blocks_, slot, bs);
         st->update_count = saved_count;
         st->last_step    = saved_last_step;
 
-        // Read embeddings directly into block buffer.
-        std::fread(slot_ptr(emb_blocks_, slot, D, bs),  sizeof(float), D, fp);
-        std::fread(slot_ptr(grad_blocks_, slot, D, bs), sizeof(float), D, fp);
+        std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  p, sizeof(float) * D);  p += sizeof(float) * D;
+        std::memcpy(slot_ptr(grad_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
         if (is_adam) {
-          std::fread(slot_ptr(m_blocks_, slot, D, bs), sizeof(float), D, fp);
-          std::fread(slot_ptr(v_blocks_, slot, D, bs), sizeof(float), D, fp);
+          std::memcpy(slot_ptr(m_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
+          std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
         }
-      } else {
-        // VERSION=0: original format (no stats).
-        int32_t saved_slot;
-        std::fread(&key,        sizeof(key),        1, fp);
-        std::fread(&saved_slot, sizeof(saved_slot), 1, fp);
+      }
+    }
+  } else {
+    // ── VERSION 0/1: single-file format (backward compat) ─────
+    size_t base_v1 = 16UL + static_cast<size_t>(D) * 4UL * 2UL;
+    size_t base_v0 = 12UL + static_cast<size_t>(D) * 4UL * 2UL;
+    size_t adam_extra = static_cast<size_t>(D) * 4UL * 2UL;
+    size_t entry_bytes_v1 = is_adam ? base_v1 + adam_extra : base_v1;
+    size_t entry_bytes_v0 = is_adam ? base_v0 + adam_extra : base_v0;
+    std::vector<char> read_buf;
+
+    for (int b = 0; b < kNumBuckets; ++b) {
+    int64_t nb;
+    int32_t bid;
+    std::fread(&nb,  sizeof(nb),  1, fp);
+    std::fread(&bid, sizeof(bid), 1, fp);
+    total_written += nb;
+
+    if (nb == 0) continue;
+
+    if (version >= 1) {
+      size_t bytes = static_cast<size_t>(nb) * entry_bytes_v1;
+      read_buf.resize(bytes);
+      std::fread(read_buf.data(), 1, bytes, fp);
+
+      const char* p = read_buf.data();
+      for (int64_t i = 0; i < nb; ++i) {
+        int64_t key;
+        uint32_t saved_count, saved_last_step;
+        std::memcpy(&key,              p,      8);  p += 8;
+        std::memcpy(&saved_count,      p,      4);  p += 4;
+        std::memcpy(&saved_last_step,  p,      4);  p += 4;
 
         int32_t slot;
         hash_table_.find_or_create(&key, &slot, 1);
         ensure_slot(slot);
 
-        // Stats are zero-initialized by ensure_slot → count=0, last_step=0.
-        // This is correct: keys from an old checkpoint start with no history.
+        auto* st = stats_ptr(stats_blocks_, slot, bs);
+        st->update_count = saved_count;
+        st->last_step    = saved_last_step;
 
-        std::fread(slot_ptr(emb_blocks_, slot, D, bs),  sizeof(float), D, fp);
-        std::fread(slot_ptr(grad_blocks_, slot, D, bs), sizeof(float), D, fp);
+        std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  p, sizeof(float) * D);  p += sizeof(float) * D;
+        std::memcpy(slot_ptr(grad_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
         if (is_adam) {
-          std::fread(slot_ptr(m_blocks_, slot, D, bs), sizeof(float), D, fp);
-          std::fread(slot_ptr(v_blocks_, slot, D, bs), sizeof(float), D, fp);
+          std::memcpy(slot_ptr(m_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
+          std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
+        }
+      }
+    } else {
+      size_t bytes = static_cast<size_t>(nb) * entry_bytes_v0;
+      read_buf.resize(bytes);
+      std::fread(read_buf.data(), 1, bytes, fp);
+
+      const char* p = read_buf.data();
+      for (int64_t i = 0; i < nb; ++i) {
+        int64_t key;
+        int32_t saved_slot;
+        std::memcpy(&key,        p, 8);  p += 8;
+        std::memcpy(&saved_slot,  p, 4);  p += 4;
+
+        int32_t slot;
+        hash_table_.find_or_create(&key, &slot, 1);
+        ensure_slot(slot);
+
+        std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  p, sizeof(float) * D);  p += sizeof(float) * D;
+        std::memcpy(slot_ptr(grad_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
+        if (is_adam) {
+          std::memcpy(slot_ptr(m_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
+          std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
         }
       }
     }
   }
 
   std::fclose(fp);
+  }
 }
 
 }  // namespace hashemb
