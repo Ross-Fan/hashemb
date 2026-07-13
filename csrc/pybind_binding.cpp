@@ -100,7 +100,7 @@ class PyHashEmbedding {
 
   // ── Binary save / load ────────────────────────────────────────
 
-  void save(const std::string& path,
+  int64_t save(const std::string& path,
             uint32_t min_count = 0,
             uint32_t max_idle_steps = 0,
             const std::string& combine = "") const {

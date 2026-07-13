@@ -115,7 +115,8 @@ class EmbeddingTable {
   ///   max_idle_steps  — keep only keys idle for <= max_idle_steps
   ///   combine         — "and" (both must trigger) or "or" (either triggers)
   ///                      Only relevant when both min_count and max_idle_steps > 0.
-  void save(const std::string& path,
+  /// Returns number of entries actually written (after eviction).
+  int64_t save(const std::string& path,
             uint32_t min_count = 0,
             uint32_t max_idle_steps = 0,
             const std::string& combine = "") const;

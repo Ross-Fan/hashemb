@@ -156,8 +156,11 @@ class HashEmbedding(torch.nn.Module):
             combine: When both min_count and max_idle_steps > 0, "and" evicts
                      only if BOTH conditions trigger, "or" evicts if EITHER
                      condition triggers.  Default "and" (conservative).
+
+        Returns:
+            Number of entries written (after eviction).
         """
-        self._table.save(path, min_count, max_idle_steps, combine)
+        return self._table.save(path, min_count, max_idle_steps, combine)
 
     def load(self, path: str):
         """Load hash table from binary file written by :meth:`save`.

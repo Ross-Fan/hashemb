@@ -713,10 +713,12 @@ def main():
     if args.save:
         binary_path = args.save.replace('.pt', '.hashemb')
         max_idle_steps = args.evict_max_idle_days * (n_batches or 0) if args.evict_max_idle_days > 0 else 0
-        model.emb.save(binary_path,
+        entries_before = model.emb.num_entries
+        entries_written = model.emb.save(binary_path,
                        min_count=args.evict_min_count,
                        max_idle_steps=max_idle_steps,
                        combine=args.evict_combine)
+        entries_evicted = entries_before - entries_written
         dense_ckpt = {
             "dense": model.predict.state_dict(),
             "opt": opt.state_dict(),
@@ -730,7 +732,9 @@ def main():
                   f" max_idle_steps={max_idle_steps}"
                   f" ({args.evict_max_idle_days}d)"
                   f" combine={args.evict_combine}")
-        print(f"         epoch={epoch}  entries={model.emb.num_entries:,}")
+        print(f"         epoch={epoch}  entries={entries_written:,}"
+              f"  evicted={entries_evicted:,}   "
+              f"before={entries_before:,}")
 
     # =========================================================================
     # Summary

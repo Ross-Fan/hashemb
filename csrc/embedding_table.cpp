@@ -498,7 +498,7 @@ void EmbeddingTable::load_state_dict_arrays(
 // VERSION=1: per-entry SlotStats (update_count + last_step) in each bucket section.
 //             Header includes global_step.  Eviction filtering applied during write.
 
-void EmbeddingTable::save(const std::string& path,
+int64_t EmbeddingTable::save(const std::string& path,
                           uint32_t min_count,
                           uint32_t max_idle_steps,
                           const std::string& combine) const {
@@ -559,6 +559,8 @@ void EmbeddingTable::save(const std::string& path,
   std::fwrite(&bs,  sizeof(bs), 1, fp);
   std::fwrite(&global_step_, sizeof(global_step_), 1, fp);
 
+  int64_t total_written = 0;
+
   // ── Bucket sections ────────────────────────────────────────────
   // VERSION=1 per-bucket format:
   //   nb_eligible(int64) + bucket_id(int32)
@@ -578,6 +580,7 @@ void EmbeddingTable::save(const std::string& path,
     }
 
     std::fwrite(&nb, sizeof(nb), 1, fp);
+    total_written += nb;
     int32_t bid = b;
     std::fwrite(&bid, sizeof(bid), 1, fp);
 
@@ -601,6 +604,7 @@ void EmbeddingTable::save(const std::string& path,
   }
 
   std::fclose(fp);
+  return total_written;
 }
 
 void EmbeddingTable::load(const std::string& path) {
@@ -663,6 +667,8 @@ void EmbeddingTable::load(const std::string& path) {
   int32_t D = embedding_dim_;
   int64_t bs = block_size_;
   bool is_adam = (opt_cfg_.type == OptimizerConfig::ADAM);
+
+  int64_t total_written = 0;
 
   // ── Bucket sections ────────────────────────────────────────────
   for (int b = 0; b < kNumBuckets; ++b) {
