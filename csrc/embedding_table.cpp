@@ -515,7 +515,14 @@ void EmbeddingTable::save(const std::string& path,
   // Only evaluated when has_filter is true.
   auto should_keep = [&](int32_t slot) -> bool {
     const auto* st = stats_ptr_const(stats_blocks_, slot, bs);
-    uint32_t idle = static_cast<uint32_t>(global_step_) - st->last_step;
+    // Defensive: if global_step_ < last_step (e.g. restored from a VERSION=0
+    // file where stats are all 0), treat idle as 0 instead of letting
+    // unsigned subtraction wrap to a huge value.
+    // idle is int64_t to match global_step_ and avoid uint32 overflow.
+    int64_t idle = 0;
+    if (global_step_ >= static_cast<int64_t>(st->last_step)) {
+      idle = global_step_ - static_cast<int64_t>(st->last_step);
+    }
 
     bool cond_a = (min_count > 0) && (st->update_count < min_count);
     bool cond_b = (max_idle_steps > 0) && (idle > max_idle_steps);
