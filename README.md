@@ -317,6 +317,108 @@ ckpt = torch.load("checkpoint.pt")
 emb.load_state_dict(ckpt["hash_emb"])
 ```
 
+
+### 特征淘汰（Key Eviction）
+
+随着训练进行，Embedding Table 会持续膨胀（新 feat_id 不断插入）。
+可以通过**淘汰（Eviction）**机制周期性地清理低频或长时间未更新的特征，控制内存占用。
+
+#### 工作原理
+
+C++ 端在每个 `step()` 中自动维护每个 slot 的统计信息：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `update_count` | uint32 | 该 key 被 step() 更新的累计次数 |
+| `last_step` | uint32 | 该 key 最近一次被 step() 更新时的 global_step |
+| `global_step_` | int64 | 全局单调递增的训练步数计数器 |
+
+淘汰在 **save 时发生**：只有通过过滤条件的 key 才会写入二进制文件。
+然后 `load` 回来即可得到一个精简后的 table。
+
+```
+训练 N 步 → save(with eviction) → load → 继续训练
+  table 膨胀        仅保留重要特征       table 已精简
+```
+
+#### 淘汰参数
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `min_count` | 0（禁用） | 淘汰 `update_count < min_count` 的 key |
+| `max_idle_steps` | 0（禁用） | 淘汰 `(global_step - last_step) > max_idle_steps` 的 key |
+| `combine` | `"and"` | 当两个条件都启用时：`"and"` = 同时满足才淘汰（保守），`"or"` = 任一满足即淘汰 |
+
+- 若仅设置 `min_count`（`max_idle_steps=0`）：只看更新频次，不看空闲时间
+- 若仅设置 `max_idle_steps`（`min_count=0`）：只看空闲时间，不看更新频次
+- 若两者都设为 0：不做淘汰，等价于普通 save
+
+#### 使用示例
+
+```python
+import torch
+from hashemb import HashEmbedding
+
+# 阶段一：训练若干 epoch，table 不断膨胀
+emb = HashEmbedding(embedding_dim=64, capacity=10_000_000, optimizer="adam", lr=0.001)
+
+for epoch in range(10):
+    for batch in loader:
+        out = emb(batch["feat_ids"])
+        loss = model(out, batch["labels"])
+        loss.backward()
+        emb.step()
+
+print(f"淘汰前 keys: {emb.num_entries:,}")
+
+# 阶段二：淘汰低频特征（仅保留更新超过 10 次的 key）
+emb.save("emb_filtered.hashemb", min_count=10)
+
+# 阶段三：重建 table，load 精简后的数据
+emb2 = HashEmbedding(embedding_dim=64, capacity=10_000_000, optimizer="adam", lr=0.001)
+emb2.load("emb_filtered.hashemb")
+print(f"淘汰后 keys: {emb2.num_entries:,}")
+
+# 阶段四：继续训练
+# stats 仍然保留，后续 save 仍可使用淘汰参数
+for epoch in range(10):
+    for batch in loader:
+        out = emb2(batch["feat_ids"])
+        loss.backward()
+        emb2.step()
+
+# 再次淘汰：更新不足 20 次 OR 空闲超过 10000 步
+emb2.save("emb_filtered2.hashemb", min_count=20, max_idle_steps=10000, combine="or")
+```
+
+#### 典型淘汰策略
+
+| 场景 | 参数设置 | 效果 |
+|---|---|---|
+| 每日定时清理 | `min_count=5, max_idle_steps=20000` | 淘汰低频且过期的噪声特征 |
+| 仅清理长时间未更新 | `min_count=0, max_idle_steps=50000` | 保留所有活跃特征，只清除僵尸 key |
+| 仅按频次清理 | `min_count=100, max_idle_steps=0` | 保留热门特征，激进清理长尾 |
+| 保守（默认） | `min_count=0, max_idle_steps=0` | 不做淘汰，保留全部 key |
+
+> **注意**：`global_step_` 会持久化到二进制文件，因此 `max_idle_steps` 的计算会跨越
+> save/load 边界。训练 10k 步后淘汰保存，load 再训练 5k 步后 `global_step_` = 15k，
+> 之前未被淘汰 key 的 `last_step` ≤ 10k，不会被误淘汰。
+
+#### 无需淘汰时仍可用 `state_dict` / `torch.save`
+
+二进制 save/load 是为淘汰和大表场景设计的。若不需要淘汰，也可以继续使用
+`state_dict()` + `torch.save` 的方式保存 checkpoint：
+
+```python
+torch.save({
+    "hash_emb": emb.state_dict(),
+    "dense": dense.state_dict(),
+}, "checkpoint.pt")
+
+ckpt = torch.load("checkpoint.pt")
+emb.load_state_dict(ckpt["hash_emb"])
+```
+
 ## 项目结构
 
 ```
@@ -343,6 +445,7 @@ hashemb/
     ├── test_dynamic_expansion.py   # 动态扩容压力测试（容量=100, 插入1000）
     ├── test_pure_torch_vs_hash.py  # nn.Embedding 与 HashEmb 逐步对比（SGD + Adam）
     ├── test_submodel.py            # BigModel 架构测试（多 field + 序列特征 + 跨设备）
+    ├── test_eviction.py            # 淘汰机制测试（24 个用例）
     ├── test_eviction.py            # 淘汰机制测试（24 个用例）
 ```
 
@@ -371,6 +474,8 @@ Architecture: per-field embedding concat → Linear(2×16, 1) → sigmoid
 
 - [x] 二进制 save/load（bucket 流式写入，零额外内存，避免大表 OOM）
 - [x] Key Eviction 淘汰机制（update_count / last_step 统计 + 硬规则过滤）
+- [x] 二进制 save/load（bucket 流式写入，零额外内存，避免大表 OOM）
+- [x] Key Eviction 淘汰机制（update_count / last_step 统计 + 硬规则过滤）
 ### V2 —— 性能优化（待开始）
 - [ ] Pinned memory buffer 池化
 - [ ] 多线程并发 lookup
@@ -385,3 +490,4 @@ Architecture: per-field embedding concat → Linear(2×16, 1) → sigmoid
 
 - [TorchRec](https://github.com/pytorch/torchrec) - PyTorch 推荐系统库
 - [FBGEMM](https://github.com/pytorch/FBGGEMM) - Facebook 量化与嵌入库
+
