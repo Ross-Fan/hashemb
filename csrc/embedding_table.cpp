@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <stdexcept>
 #include <algorithm>
 #include <atomic>
@@ -666,35 +667,27 @@ void EmbeddingTable::load(const std::string& path) {
 
   // ── Load bucket data ──────────────────────────────────────────
   if (version >= 2) {
-    // Multi-file format: 16 bucket files loaded in parallel via ThreadPool.
-    // Pre-allocate all blocks to avoid data races in ensure_slot.
+    // Multi-file format: load each bucket file sequentially.
+    // Pre-allocate all blocks upfront.
     std::fclose(fp);
     int64_t total_needed = hash_table_.num_entries() + file_n;
     if (total_needed > 0) ensure_slot(total_needed - 1);
 
-    std::atomic<int64_t> total_atomic{0};
+    std::vector<char> lbuf;  // reuse across buckets
 
-    // Build bucket paths upfront (captured by reference in parallel lambda).
-    char bucket_paths[kNumBuckets][2048];
     for (int b = 0; b < kNumBuckets; ++b) {
-      std::snprintf(bucket_paths[b], sizeof(bucket_paths[b]),
+      char bucket_path[2048];
+      std::snprintf(bucket_path, sizeof(bucket_path),
                     "%s_bucket_%02d", path.c_str(), b);
-    }
-
-    ThreadPool::instance().parallel_for(
-        static_cast<size_t>(kNumBuckets), [&](size_t b) {
-      FILE* bfp = std::fopen(bucket_paths[b], "rb");
-      if (!bfp) {
-        std::fprintf(stderr, "Cannot open %s\n", bucket_paths[b]);
-        return;
-      }
+      FILE* bfp = std::fopen(bucket_path, "rb");
+      if (!bfp) throw std::runtime_error("Cannot open " + std::string(bucket_path) + " for reading");
 
       // Read entire bucket file
       std::fseek(bfp, 0, SEEK_END);
       long fsize = std::ftell(bfp);
-      if (fsize <= 12) { std::fclose(bfp); return; }
+      if (fsize <= 12) { std::fclose(bfp); continue; }
       std::rewind(bfp);
-      std::vector<char> lbuf(static_cast<size_t>(fsize));
+      lbuf.resize(static_cast<size_t>(fsize));
       std::fread(lbuf.data(), 1, static_cast<size_t>(fsize), bfp);
       std::fclose(bfp);
 
@@ -702,8 +695,26 @@ void EmbeddingTable::load(const std::string& path) {
       int64_t nb; int32_t bid;
       std::memcpy(&nb,  p, 8);  p += 8;
       std::memcpy(&bid, p, 4);  p += 4;
-      total_atomic.fetch_add(nb, std::memory_order_relaxed);
+      total_written += nb;
 
+      // Batch: collect all keys, then one find_or_create call per bucket
+      auto t0 = std::chrono::steady_clock::now();
+      std::vector<int64_t> keys_batch(nb);
+      {
+        const char* pk = p;
+        size_t entry_stride = 16UL + static_cast<size_t>(D) * 4UL * 2UL;
+        if (is_adam) entry_stride += static_cast<size_t>(D) * 4UL * 2UL;
+        for (int64_t i = 0; i < nb; ++i) {
+          std::memcpy(&keys_batch[i], pk, 8);
+          pk += entry_stride;
+        }
+      }
+
+      std::vector<int32_t> slots_batch(nb);
+      hash_table_.find_or_create(keys_batch.data(), slots_batch.data(), nb);
+      auto t1 = std::chrono::steady_clock::now();
+
+      // Copy stats + embeddings
       for (int64_t i = 0; i < nb; ++i) {
         int64_t key;
         uint32_t saved_count, saved_last_step;
@@ -711,11 +722,7 @@ void EmbeddingTable::load(const std::string& path) {
         std::memcpy(&saved_count,      p, 4);  p += 4;
         std::memcpy(&saved_last_step,  p, 4);  p += 4;
 
-        int32_t slot;
-        hash_table_.find_or_create(&key, &slot, 1);
-        // No ensure_slot needed — pre-allocated above.
-        // But ensure_slot is safe to call (idempotent when block exists).
-
+        int32_t slot = slots_batch[i];
         auto* st = stats_ptr(stats_blocks_, slot, bs);
         st->update_count = saved_count;
         st->last_step    = saved_last_step;
@@ -727,9 +734,12 @@ void EmbeddingTable::load(const std::string& path) {
           std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
         }
       }
-    });
-
-    total_written = total_atomic.load();
+      auto t2 = std::chrono::steady_clock::now();
+      double dt_find = std::chrono::duration<double>(t1 - t0).count();
+      double dt_copy = std::chrono::duration<double>(t2 - t1).count();
+      std::fprintf(stderr, "[load] bucket %d: %ld entries  find=%.2fs  copy=%.2fs\n",
+                   b, (long)nb, dt_find, dt_copy);
+    }
   } else {
     // ── VERSION 0/1: single-file format (backward compat) ─────
     size_t base_v1 = 16UL + static_cast<size_t>(D) * 4UL * 2UL;
