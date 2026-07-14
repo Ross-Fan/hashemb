@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <algorithm>
+#include <atomic>
 #include <utility>
 #include <unordered_map>
 #include <thread>
@@ -665,32 +666,43 @@ void EmbeddingTable::load(const std::string& path) {
 
   // ── Load bucket data ──────────────────────────────────────────
   if (version >= 2) {
-    // Multi-file format: each bucket in a separate .hashemb_bucket_XX file.
-    // Read entire file, then parse in memory — no byte-size math needed.
+    // Multi-file format: 16 bucket files loaded in parallel via ThreadPool.
+    // Pre-allocate all blocks to avoid data races in ensure_slot.
     std::fclose(fp);
-    std::vector<char> buf;
+    int64_t total_needed = hash_table_.num_entries() + file_n;
+    if (total_needed > 0) ensure_slot(total_needed - 1);
 
+    std::atomic<int64_t> total_atomic{0};
+
+    // Build bucket paths upfront (captured by reference in parallel lambda).
+    char bucket_paths[kNumBuckets][2048];
     for (int b = 0; b < kNumBuckets; ++b) {
-      char bucket_path[2048];
-      std::snprintf(bucket_path, sizeof(bucket_path), "%s_bucket_%02d",
-                    path.c_str(), b);
-      FILE* bfp = std::fopen(bucket_path, "rb");
-      if (!bfp) throw std::runtime_error("Cannot open " + std::string(bucket_path) + " for reading");
+      std::snprintf(bucket_paths[b], sizeof(bucket_paths[b]),
+                    "%s_bucket_%02d", path.c_str(), b);
+    }
+
+    ThreadPool::instance().parallel_for(
+        static_cast<size_t>(kNumBuckets), [&](size_t b) {
+      FILE* bfp = std::fopen(bucket_paths[b], "rb");
+      if (!bfp) {
+        std::fprintf(stderr, "Cannot open %s\n", bucket_paths[b]);
+        return;
+      }
 
       // Read entire bucket file
       std::fseek(bfp, 0, SEEK_END);
       long fsize = std::ftell(bfp);
-      if (fsize <= 0) { std::fclose(bfp); continue; }
+      if (fsize <= 12) { std::fclose(bfp); return; }
       std::rewind(bfp);
-      buf.resize(static_cast<size_t>(fsize));
-      std::fread(buf.data(), 1, static_cast<size_t>(fsize), bfp);
+      std::vector<char> lbuf(static_cast<size_t>(fsize));
+      std::fread(lbuf.data(), 1, static_cast<size_t>(fsize), bfp);
       std::fclose(bfp);
 
-      const char* p = buf.data();
+      const char* p = lbuf.data();
       int64_t nb; int32_t bid;
       std::memcpy(&nb,  p, 8);  p += 8;
       std::memcpy(&bid, p, 4);  p += 4;
-      total_written += nb;
+      total_atomic.fetch_add(nb, std::memory_order_relaxed);
 
       for (int64_t i = 0; i < nb; ++i) {
         int64_t key;
@@ -701,7 +713,8 @@ void EmbeddingTable::load(const std::string& path) {
 
         int32_t slot;
         hash_table_.find_or_create(&key, &slot, 1);
-        ensure_slot(slot);
+        // No ensure_slot needed — pre-allocated above.
+        // But ensure_slot is safe to call (idempotent when block exists).
 
         auto* st = stats_ptr(stats_blocks_, slot, bs);
         st->update_count = saved_count;
@@ -714,7 +727,9 @@ void EmbeddingTable::load(const std::string& path) {
           std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
         }
       }
-    }
+    });
+
+    total_written = total_atomic.load();
   } else {
     // ── VERSION 0/1: single-file format (backward compat) ─────
     size_t base_v1 = 16UL + static_cast<size_t>(D) * 4UL * 2UL;
