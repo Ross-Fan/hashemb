@@ -508,7 +508,7 @@ def main():
             opt.load_state_dict(ckpt["opt"])
             resume_epoch = ckpt.get("epoch", 0)
             print(f"  [RESUME] Hash table from {os.path.basename(binary_path)}"
-                  f"  ({dt_load:.1f}s)")
+                  f"  ({dt_load:.1f}s)", flush=True)
             print(f"           Dense model from {os.path.basename(args.resume)}")
             print(f"           prev_epoch={resume_epoch}  "
                   f"entries={model.emb.num_entries:,}")
@@ -721,12 +721,15 @@ def main():
         max_idle_steps = args.evict_max_idle_days * (n_batches or 0) if args.evict_max_idle_days > 0 else 0
         print(f"  [SAVE] Writing hash table to {binary_path} ...", flush=True)
         entries_before = model.emb.num_entries
+        t_save = time.time()
         entries_written = model.emb.save(binary_path,
                        min_count=args.evict_min_count,
                        max_idle_steps=max_idle_steps,
                        combine=args.evict_combine)
+        dt_save = time.time() - t_save
         entries_evicted = entries_before - entries_written
-        print(f"  [SAVE] Hash table done ({entries_written:,} entries, {entries_evicted:,} evicted)", flush=True)
+        print(f"  [SAVE] Hash table done ({entries_written:,} entries, {entries_evicted:,} evicted)  "
+              f"[{dt_save:.1f}s]", flush=True)
         print(f"  [SAVE] Writing dense model to {args.save} ...", flush=True)
         dense_ckpt = {
             "dense": model.predict.state_dict(),
