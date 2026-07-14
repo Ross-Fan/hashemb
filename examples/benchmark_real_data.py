@@ -648,9 +648,9 @@ def main():
                 int_scores, int_labels = [], []
                 int_t_start = time.perf_counter()
 
-            if bi >= 200:
-                print(f"[DEBUG] DEBUG STOP TRAING @ 200")
-                break 
+            # if bi >= 200:
+            #     print(f"[DEBUG] DEBUG STOP TRAING @ 200")
+            #     break 
         # ── Validation ──
         if val_loader is not None:
             model.eval()
