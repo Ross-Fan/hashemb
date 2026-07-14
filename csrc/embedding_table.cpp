@@ -502,7 +502,6 @@ int64_t EmbeddingTable::save(const std::string& path,
                           uint32_t min_count,
                           uint32_t max_idle_steps,
                           const std::string& combine) const {
-  std::fprintf(stderr, "[save] opening %s\n", path.c_str());
   FILE* fp = std::fopen(path.c_str(), "wb");
   if (!fp) throw std::runtime_error("Cannot open " + path + " for writing");
 
@@ -562,7 +561,6 @@ int64_t EmbeddingTable::save(const std::string& path,
 
   int64_t total_written = 0;
 
-  std::fprintf(stderr, "[save] header written, starting bucket files...\n");
   // ── Bucket files (VERSION=2: one file per bucket) ─────────────
   // Per-bucket file: [nb: int64][bid: int32] + nb entries.
   for (int b = 0; b < kNumBuckets; ++b) {
@@ -606,12 +604,9 @@ int64_t EmbeddingTable::save(const std::string& path,
       }
     }
     std::fclose(bfp);
-    std::fprintf(stderr, "[save] bucket %d done (%ld entries)\n", b, nb);
   }
 
-  std::fprintf(stderr, "[save] all buckets done, closing header...\n");
   std::fclose(fp);
-  std::fprintf(stderr, "[save] header closed, returning %ld\n", total_written);
   return total_written;
 }
 
