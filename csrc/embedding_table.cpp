@@ -672,21 +672,11 @@ void EmbeddingTable::load(const std::string& path) {
   }
   std::fclose(fp);
 
-  // Multi-file format: load each bucket file sequentially.
-
-  // Pre-allocate all blocks upfront.
-
-  std::fclose(fp);
-
   int64_t total_needed = hash_table_.num_entries() + file_n;
 
   if (total_needed > 0) ensure_slot(total_needed - 1);
 
-
-
   std::vector<char> lbuf;  // reuse across buckets
-
-
 
   for (int b = 0; b < kNumBuckets; ++b) {
 
@@ -699,8 +689,6 @@ void EmbeddingTable::load(const std::string& path) {
     FILE* bfp = std::fopen(bucket_path, "rb");
 
     if (!bfp) throw std::runtime_error("Cannot open " + std::string(bucket_path) + " for reading");
-
-
 
     // Read entire bucket file
 
@@ -718,8 +706,6 @@ void EmbeddingTable::load(const std::string& path) {
 
     std::fclose(bfp);
 
-
-
     const char* p = lbuf.data();
 
     int64_t nb; int32_t bid;
@@ -729,8 +715,6 @@ void EmbeddingTable::load(const std::string& path) {
     std::memcpy(&bid, p, 4);  p += 4;
 
     total_written += nb;
-
-
 
     // Batch: collect all keys, then one find_or_create call per bucket
 
@@ -756,15 +740,11 @@ void EmbeddingTable::load(const std::string& path) {
 
     }
 
-
-
     std::vector<int32_t> slots_batch(nb);
 
     hash_table_.find_or_create(keys_batch.data(), slots_batch.data(), nb);
 
     auto t1 = std::chrono::steady_clock::now();
-
-
 
     // Copy stats + embeddings
 
@@ -780,8 +760,6 @@ void EmbeddingTable::load(const std::string& path) {
 
       std::memcpy(&saved_last_step,  p, 4);  p += 4;
 
-
-
       int32_t slot = slots_batch[i];
 
       auto* st = stats_ptr(stats_blocks_, slot, bs);
@@ -789,8 +767,6 @@ void EmbeddingTable::load(const std::string& path) {
       st->update_count = saved_count;
 
       st->last_step    = saved_last_step;
-
-
 
       std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  p, sizeof(float) * D);  p += sizeof(float) * D;
 
