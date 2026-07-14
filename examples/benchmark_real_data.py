@@ -716,20 +716,28 @@ def main():
     if args.save:
         binary_path = args.save.replace('.pt', '.hashemb')
         max_idle_steps = args.evict_max_idle_days * (n_batches or 0) if args.evict_max_idle_days > 0 else 0
+        print(f"  [SAVE] Writing hash table to {binary_path} ...", flush=True)
         entries_before = model.emb.num_entries
         entries_written = model.emb.save(binary_path,
                        min_count=args.evict_min_count,
                        max_idle_steps=max_idle_steps,
                        combine=args.evict_combine)
         entries_evicted = entries_before - entries_written
+        print(f"  [SAVE] Hash table done ({entries_written:,} entries, {entries_evicted:,} evicted)", flush=True)
+        print(f"  [SAVE] Writing dense model to {args.save} ...", flush=True)
         dense_ckpt = {
             "dense": model.predict.state_dict(),
             "opt": opt.state_dict(),
             "epoch": epoch,
         }
-        torch.save(dense_ckpt, args.save)
+        try:
+            torch.save(dense_ckpt, args.save)
+            print(f"  [SAVE] Dense model done", flush=True)
+        except Exception as e:
+            print(f"  [SAVE] ERROR saving dense model: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
         print(f"\n  [SAVE] Hash table → {binary_path}")
-        print(f"         Dense model → {args.save}")
         if args.evict_min_count > 0 or args.evict_max_idle_days > 0:
             print(f"         Eviction: min_count={args.evict_min_count}"
                   f" max_idle_steps={max_idle_steps}"
