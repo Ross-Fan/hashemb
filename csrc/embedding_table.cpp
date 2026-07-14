@@ -292,27 +292,17 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
   }
   if (max_slot >= 0) ensure_slot(max_slot);
 
-  // Collect unique valid slots (dedup).  Reserve a reasonable lower bound.
-  std::unordered_map<int32_t, bool> seen_slots;
-  seen_slots.reserve(static_cast<size_t>(std::min(n, static_cast<int64_t>(200000))));
-
-  // Direct accumulation into grad_blocks_ (no sort, no heap idx array).
-  // Each occurrence of the same slot is added into the same grad buffer,
-  // naturally implementing "scatter add".
+  // Direct accumulation into grad_blocks_; mark dirty slots inline.
+  // slot_dirty_ is already sized to cover all valid slots (via ensure_slot
+  // above), so we skip the unordered_map and use it directly for dedup.
   for (int64_t i = 0; i < n; ++i) {
     int32_t slot = slot_indices[i];
     if (slot < 0) continue;
 
-    seen_slots[slot] = true;
-
     float* grad_dst = slot_ptr(grad_blocks_, slot, D, block_size_);
     const float* g = grads + i * D;
     for (int32_t d = 0; d < D; ++d) grad_dst[d] += g[d];
-  }
 
-  // Mark dirty slots for step().
-  for (const auto& p : seen_slots) {
-    int32_t slot = p.first;
     if (!slot_dirty_[slot]) {
       slot_dirty_[slot] = true;
       dirty_slots_.push_back(slot);
