@@ -104,7 +104,7 @@ class PyHashEmbedding {
             uint32_t min_count = 0,
             uint32_t max_idle_steps = 0,
             const std::string& combine = "") const {
-    table_.save(path, min_count, max_idle_steps, combine);
+    return table_.save(path, min_count, max_idle_steps, combine);
   }
   void load(const std::string& path) { table_.load(path); }
 
