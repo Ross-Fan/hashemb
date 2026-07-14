@@ -665,155 +665,159 @@ void EmbeddingTable::load(const std::string& path) {
 
   int64_t total_written = 0;
 
-  // ── Load bucket data ──────────────────────────────────────────
-  if (version >= 2) {
-    // Multi-file format: load each bucket file sequentially.
-    // Pre-allocate all blocks upfront.
+  if (version < 2) {
     std::fclose(fp);
-    int64_t total_needed = hash_table_.num_entries() + file_n;
-    if (total_needed > 0) ensure_slot(total_needed - 1);
-
-    std::vector<char> lbuf;  // reuse across buckets
-
-    for (int b = 0; b < kNumBuckets; ++b) {
-      char bucket_path[2048];
-      std::snprintf(bucket_path, sizeof(bucket_path),
-                    "%s_bucket_%02d", path.c_str(), b);
-      FILE* bfp = std::fopen(bucket_path, "rb");
-      if (!bfp) throw std::runtime_error("Cannot open " + std::string(bucket_path) + " for reading");
-
-      // Read entire bucket file
-      std::fseek(bfp, 0, SEEK_END);
-      long fsize = std::ftell(bfp);
-      if (fsize <= 12) { std::fclose(bfp); continue; }
-      std::rewind(bfp);
-      lbuf.resize(static_cast<size_t>(fsize));
-      std::fread(lbuf.data(), 1, static_cast<size_t>(fsize), bfp);
-      std::fclose(bfp);
-
-      const char* p = lbuf.data();
-      int64_t nb; int32_t bid;
-      std::memcpy(&nb,  p, 8);  p += 8;
-      std::memcpy(&bid, p, 4);  p += 4;
-      total_written += nb;
-
-      // Batch: collect all keys, then one find_or_create call per bucket
-      auto t0 = std::chrono::steady_clock::now();
-      std::vector<int64_t> keys_batch(nb);
-      {
-        const char* pk = p;
-        size_t entry_stride = 16UL + static_cast<size_t>(D) * 4UL * 2UL;
-        if (is_adam) entry_stride += static_cast<size_t>(D) * 4UL * 2UL;
-        for (int64_t i = 0; i < nb; ++i) {
-          std::memcpy(&keys_batch[i], pk, 8);
-          pk += entry_stride;
-        }
-      }
-
-      std::vector<int32_t> slots_batch(nb);
-      hash_table_.find_or_create(keys_batch.data(), slots_batch.data(), nb);
-      auto t1 = std::chrono::steady_clock::now();
-
-      // Copy stats + embeddings
-      for (int64_t i = 0; i < nb; ++i) {
-        int64_t key;
-        uint32_t saved_count, saved_last_step;
-        std::memcpy(&key,              p, 8);  p += 8;
-        std::memcpy(&saved_count,      p, 4);  p += 4;
-        std::memcpy(&saved_last_step,  p, 4);  p += 4;
-
-        int32_t slot = slots_batch[i];
-        auto* st = stats_ptr(stats_blocks_, slot, bs);
-        st->update_count = saved_count;
-        st->last_step    = saved_last_step;
-
-        std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  p, sizeof(float) * D);  p += sizeof(float) * D;
-        std::memcpy(slot_ptr(grad_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-        if (is_adam) {
-          std::memcpy(slot_ptr(m_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-          std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-        }
-      }
-      auto t2 = std::chrono::steady_clock::now();
-      double dt_find = std::chrono::duration<double>(t1 - t0).count();
-      double dt_copy = std::chrono::duration<double>(t2 - t1).count();
-      std::fprintf(stderr, "[load] bucket %d: %ld entries  find=%.2fs  copy=%.2fs\n",
-                   b, (long)nb, dt_find, dt_copy);
-    }
-  } else {
-    // ── VERSION 0/1: single-file format (backward compat) ─────
-    size_t base_v1 = 16UL + static_cast<size_t>(D) * 4UL * 2UL;
-    size_t base_v0 = 12UL + static_cast<size_t>(D) * 4UL * 2UL;
-    size_t adam_extra = static_cast<size_t>(D) * 4UL * 2UL;
-    size_t entry_bytes_v1 = is_adam ? base_v1 + adam_extra : base_v1;
-    size_t entry_bytes_v0 = is_adam ? base_v0 + adam_extra : base_v0;
-    std::vector<char> read_buf;
-
-    for (int b = 0; b < kNumBuckets; ++b) {
-    int64_t nb;
-    int32_t bid;
-    std::fread(&nb,  sizeof(nb),  1, fp);
-    std::fread(&bid, sizeof(bid), 1, fp);
-    total_written += nb;
-
-    if (nb == 0) continue;
-
-    if (version >= 1) {
-      size_t bytes = static_cast<size_t>(nb) * entry_bytes_v1;
-      read_buf.resize(bytes);
-      std::fread(read_buf.data(), 1, bytes, fp);
-
-      const char* p = read_buf.data();
-      for (int64_t i = 0; i < nb; ++i) {
-        int64_t key;
-        uint32_t saved_count, saved_last_step;
-        std::memcpy(&key,              p,      8);  p += 8;
-        std::memcpy(&saved_count,      p,      4);  p += 4;
-        std::memcpy(&saved_last_step,  p,      4);  p += 4;
-
-        int32_t slot;
-        hash_table_.find_or_create(&key, &slot, 1);
-        ensure_slot(slot);
-
-        auto* st = stats_ptr(stats_blocks_, slot, bs);
-        st->update_count = saved_count;
-        st->last_step    = saved_last_step;
-
-        std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  p, sizeof(float) * D);  p += sizeof(float) * D;
-        std::memcpy(slot_ptr(grad_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-        if (is_adam) {
-          std::memcpy(slot_ptr(m_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-          std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-        }
-      }
-    } else {
-      size_t bytes = static_cast<size_t>(nb) * entry_bytes_v0;
-      read_buf.resize(bytes);
-      std::fread(read_buf.data(), 1, bytes, fp);
-
-      const char* p = read_buf.data();
-      for (int64_t i = 0; i < nb; ++i) {
-        int64_t key;
-        int32_t saved_slot;
-        std::memcpy(&key,        p, 8);  p += 8;
-        std::memcpy(&saved_slot,  p, 4);  p += 4;
-
-        int32_t slot;
-        hash_table_.find_or_create(&key, &slot, 1);
-        ensure_slot(slot);
-
-        std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  p, sizeof(float) * D);  p += sizeof(float) * D;
-        std::memcpy(slot_ptr(grad_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-        if (is_adam) {
-          std::memcpy(slot_ptr(m_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-          std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-        }
-      }
-    }
+    throw std::runtime_error("Unsupported file version " + std::to_string(version)
+                           + ". Only VERSION >= 2 is supported.");
   }
+  std::fclose(fp);
+
+  // Multi-file format: load each bucket file sequentially.
+
+  // Pre-allocate all blocks upfront.
 
   std::fclose(fp);
+
+  int64_t total_needed = hash_table_.num_entries() + file_n;
+
+  if (total_needed > 0) ensure_slot(total_needed - 1);
+
+
+
+  std::vector<char> lbuf;  // reuse across buckets
+
+
+
+  for (int b = 0; b < kNumBuckets; ++b) {
+
+    char bucket_path[2048];
+
+    std::snprintf(bucket_path, sizeof(bucket_path),
+
+                  "%s_bucket_%02d", path.c_str(), b);
+
+    FILE* bfp = std::fopen(bucket_path, "rb");
+
+    if (!bfp) throw std::runtime_error("Cannot open " + std::string(bucket_path) + " for reading");
+
+
+
+    // Read entire bucket file
+
+    std::fseek(bfp, 0, SEEK_END);
+
+    long fsize = std::ftell(bfp);
+
+    if (fsize <= 12) { std::fclose(bfp); continue; }
+
+    std::rewind(bfp);
+
+    lbuf.resize(static_cast<size_t>(fsize));
+
+    std::fread(lbuf.data(), 1, static_cast<size_t>(fsize), bfp);
+
+    std::fclose(bfp);
+
+
+
+    const char* p = lbuf.data();
+
+    int64_t nb; int32_t bid;
+
+    std::memcpy(&nb,  p, 8);  p += 8;
+
+    std::memcpy(&bid, p, 4);  p += 4;
+
+    total_written += nb;
+
+
+
+    // Batch: collect all keys, then one find_or_create call per bucket
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::vector<int64_t> keys_batch(nb);
+
+    {
+
+      const char* pk = p;
+
+      size_t entry_stride = 16UL + static_cast<size_t>(D) * 4UL * 2UL;
+
+      if (is_adam) entry_stride += static_cast<size_t>(D) * 4UL * 2UL;
+
+      for (int64_t i = 0; i < nb; ++i) {
+
+        std::memcpy(&keys_batch[i], pk, 8);
+
+        pk += entry_stride;
+
+      }
+
+    }
+
+
+
+    std::vector<int32_t> slots_batch(nb);
+
+    hash_table_.find_or_create(keys_batch.data(), slots_batch.data(), nb);
+
+    auto t1 = std::chrono::steady_clock::now();
+
+
+
+    // Copy stats + embeddings
+
+    for (int64_t i = 0; i < nb; ++i) {
+
+      int64_t key;
+
+      uint32_t saved_count, saved_last_step;
+
+      std::memcpy(&key,              p, 8);  p += 8;
+
+      std::memcpy(&saved_count,      p, 4);  p += 4;
+
+      std::memcpy(&saved_last_step,  p, 4);  p += 4;
+
+
+
+      int32_t slot = slots_batch[i];
+
+      auto* st = stats_ptr(stats_blocks_, slot, bs);
+
+      st->update_count = saved_count;
+
+      st->last_step    = saved_last_step;
+
+
+
+      std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  p, sizeof(float) * D);  p += sizeof(float) * D;
+
+      std::memcpy(slot_ptr(grad_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
+
+      if (is_adam) {
+
+        std::memcpy(slot_ptr(m_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
+
+        std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
+
+      }
+
+    }
+
+    auto t2 = std::chrono::steady_clock::now();
+
+    double dt_find = std::chrono::duration<double>(t1 - t0).count();
+
+    double dt_copy = std::chrono::duration<double>(t2 - t1).count();
+
+    std::fprintf(stderr, "[load] bucket %d: %ld entries  find=%.2fs  copy=%.2fs\n",
+
+                 b, (long)nb, dt_find, dt_copy);
+
   }
+
 }
 
 }  // namespace hashemb
