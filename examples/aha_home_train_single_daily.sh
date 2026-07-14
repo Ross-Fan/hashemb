@@ -188,7 +188,7 @@ fi
 echo ""
 
 # ── Train ──
-python "${PY_ARGS[@]}"
+python -u "${PY_ARGS[@]}"
 
 echo ""
 echo "  Done: $DAY  →  ${ckpt_path%.pt}.hashemb  +  $ckpt_path"
