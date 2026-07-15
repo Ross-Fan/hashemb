@@ -338,7 +338,7 @@ def main():
         val_ds = StreamingParquetDataset(args.val_data, max_records=0,
                                          parquet_batch_size=args.parquet_batch_size)
         val_loader = DataLoader(val_ds, batch_size=batch_size, collate_fn=collate_fn,
-                                num_workers=0) if args.num_workers > 0 else None)
+                                num_workers=args.num_workers, prefetch_factor=args.prefetch_factor)
 
     # ── Model ──
     print(f"\n[MEM] Before model: {mem1:.0f} MB")
