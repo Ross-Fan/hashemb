@@ -716,81 +716,48 @@ void EmbeddingTable::load(const std::string& path) {
 
     total_written += nb;
 
-    // Batch: collect all keys, then one find_or_create call per bucket
-
-    auto t0 = std::chrono::steady_clock::now();
-
-    std::vector<int64_t> keys_batch(nb);
-
-    {
-
-      const char* pk = p;
-
+      // Direct insert: collect keys, one-lock insert (no lookup needed).
+      auto t0 = std::chrono::steady_clock::now();
+      std::vector<int64_t> keys(nb);
       size_t entry_stride = 16UL + static_cast<size_t>(D) * 4UL * 2UL;
-
       if (is_adam) entry_stride += static_cast<size_t>(D) * 4UL * 2UL;
-
-      for (int64_t i = 0; i < nb; ++i) {
-
-        std::memcpy(&keys_batch[i], pk, 8);
-
-        pk += entry_stride;
-
+      {
+        const char* pk = p;
+        for (int64_t i = 0; i < nb; ++i) {
+          std::memcpy(&keys[i], pk, 8);
+          pk += entry_stride;
+        }
       }
+      int32_t start_slot = hash_table_.insert_all(b, keys.data(), nb);
+      auto t1 = std::chrono::steady_clock::now();
 
-    }
+      // Copy stats + embeddings (re-scan buffer, fast in-memory)
+      {
+        const char* pe = p;
+        for (int64_t i = 0; i < nb; ++i) {
+          pe += 8;  // skip key
+          uint32_t saved_count, saved_last_step;
+          std::memcpy(&saved_count,      pe, 4);  pe += 4;
+          std::memcpy(&saved_last_step,  pe, 4);  pe += 4;
 
-    std::vector<int32_t> slots_batch(nb);
+          int32_t slot = start_slot + static_cast<int32_t>(i);
+          auto* st = stats_ptr(stats_blocks_, slot, bs);
+          st->update_count = saved_count;
+          st->last_step    = saved_last_step;
 
-    hash_table_.find_or_create(keys_batch.data(), slots_batch.data(), nb);
-
-    auto t1 = std::chrono::steady_clock::now();
-
-    // Copy stats + embeddings
-
-    for (int64_t i = 0; i < nb; ++i) {
-
-      int64_t key;
-
-      uint32_t saved_count, saved_last_step;
-
-      std::memcpy(&key,              p, 8);  p += 8;
-
-      std::memcpy(&saved_count,      p, 4);  p += 4;
-
-      std::memcpy(&saved_last_step,  p, 4);  p += 4;
-
-      int32_t slot = slots_batch[i];
-
-      auto* st = stats_ptr(stats_blocks_, slot, bs);
-
-      st->update_count = saved_count;
-
-      st->last_step    = saved_last_step;
-
-      std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  p, sizeof(float) * D);  p += sizeof(float) * D;
-
-      std::memcpy(slot_ptr(grad_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-
-      if (is_adam) {
-
-        std::memcpy(slot_ptr(m_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-
-        std::memcpy(slot_ptr(v_blocks_, slot, D, bs), p, sizeof(float) * D);  p += sizeof(float) * D;
-
+          std::memcpy(slot_ptr(emb_blocks_, slot, D, bs),  pe, sizeof(float) * D);  pe += sizeof(float) * D;
+          std::memcpy(slot_ptr(grad_blocks_, slot, D, bs), pe, sizeof(float) * D);  pe += sizeof(float) * D;
+          if (is_adam) {
+            std::memcpy(slot_ptr(m_blocks_, slot, D, bs), pe, sizeof(float) * D);  pe += sizeof(float) * D;
+            std::memcpy(slot_ptr(v_blocks_, slot, D, bs), pe, sizeof(float) * D);  pe += sizeof(float) * D;
+          }
+        }
       }
-
-    }
-
-    auto t2 = std::chrono::steady_clock::now();
-
-    double dt_find = std::chrono::duration<double>(t1 - t0).count();
-
-    double dt_copy = std::chrono::duration<double>(t2 - t1).count();
-
-    std::fprintf(stderr, "[load] bucket %d: %ld entries  find=%.2fs  copy=%.2fs\n",
-
-                 b, (long)nb, dt_find, dt_copy);
+      auto t2 = std::chrono::steady_clock::now();
+      double dt_ins = std::chrono::duration<double>(t1 - t0).count();
+      double dt_cpy = std::chrono::duration<double>(t2 - t1).count();
+      std::fprintf(stderr, "[load] bucket %d: %ld entries  ins=%.2fs  copy=%.2fs\n",
+                   b, (long)nb, dt_ins, dt_cpy);
 
   }
 

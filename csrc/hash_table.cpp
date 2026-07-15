@@ -266,4 +266,17 @@ int64_t HashTable::bulk_insert(const int64_t* keys, const int32_t* slots,
   return inserted;
 }
 
+int32_t HashTable::insert_all(int bucket_idx, const int64_t* keys, int64_t n) {
+  int32_t start_slot = static_cast<int32_t>(
+      num_entries_.fetch_add(n, std::memory_order_acq_rel));
+  std::unique_lock lock(buckets_[bucket_idx].mtx);
+  for (int64_t i = 0; i < n; ++i) {
+    int32_t slot = start_slot + static_cast<int32_t>(i);
+    while (!buckets_[bucket_idx].insert(keys[i], slot)) {
+      buckets_[bucket_idx].grow();
+    }
+  }
+  return start_slot;
+}
+
 }  // namespace hashemb

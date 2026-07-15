@@ -54,6 +54,11 @@ class HashTable {
   /// Keys must NOT already exist.  Returns number of entries inserted.
   int64_t bulk_insert(const int64_t* keys, const int32_t* slots, int64_t n);
 
+  /// Direct batch insert for cold-start load. All keys must hash to bucket_idx
+  /// and must NOT already exist. One lock, no per-key lookup.
+  /// Returns starting slot index; key[i] -> slot = return + i.
+  int32_t insert_all(int bucket_idx, const int64_t* keys, int64_t n);
+
   int64_t num_entries() const { return num_entries_.load(std::memory_order_relaxed); }
 
  private:
