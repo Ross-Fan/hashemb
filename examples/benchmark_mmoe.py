@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""HashEmb benchmark — MMoE + Transformer + PPNet 推荐模型 (PyTorch)."""
 
 import argparse
 import glob
