@@ -31,7 +31,7 @@ DOP="${3:?Usage: $0 <day> <model_name> <debug_or_prod>}"
 
 TRAIN_BASE_DIR="${TRAIN_BASE_DIR:-/data/hashemb}"
 CKPT_DIR="${CKPT_DIR:-$TRAIN_BASE_DIR/checkpoints}"
-PYTHON_SCRIPT="$(dirname "$0")/benchmark_mmoe.py.py"
+PYTHON_SCRIPT="$(dirname "$0")/benchmark_mmoe.py"
 
 echo "DAY: ${DAY} MODEL_NAME: ${MODEL_NAME} TRAIN_BASE_DIR: ${TRAIN_BASE_DIR} CKPT_DIR: ${CKPT_DIR} PYTHON_SCRIPT: ${PYTHON_SCRIPT}"
 dt=${DAY}
