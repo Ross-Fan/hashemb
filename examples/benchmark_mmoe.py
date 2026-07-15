@@ -101,7 +101,7 @@ class StreamingParquetDataset(torch.utils.data.IterableDataset):
                     yield feat_ids[j], labels[j]
 
 def collate_fn(batch):
-    ids = torch.stack([b[0] for b in batch])
+    ids = torch.stack([torch.as_tensor(b[0]) for b in batch])
     lbl = torch.tensor([b[1].item() for b in batch], dtype=torch.float32)
     return ids, lbl
 
