@@ -269,12 +269,41 @@ int64_t HashTable::bulk_insert(const int64_t* keys, const int32_t* slots,
 int32_t HashTable::insert_all(int bucket_idx, const int64_t* keys, int64_t n) {
   int32_t start_slot = static_cast<int32_t>(
       num_entries_.fetch_add(n, std::memory_order_acq_rel));
-  std::unique_lock lock(buckets_[bucket_idx].mtx);
+  Bucket& bucket = buckets_[bucket_idx];
+  std::unique_lock lock(bucket.mtx);
+
+  int32_t before_size = bucket.size;
+  int32_t before_cap  = bucket.capacity;
+  double before_lf = before_cap > 0 ? (double)before_size / before_cap : 0.0;
+
+  // Pre-grow to final capacity to avoid per-insert grow/rehash
+  int32_t needed = bucket.size + static_cast<int32_t>(n);
+  int32_t target = next_pow2(static_cast<int32_t>(needed * 1.25 + 1));
+  int32_t grows = 0;
+  while (bucket.capacity < target) {
+    bucket.grow();
+    ++grows;
+  }
+
+  std::fprintf(stderr,
+      "[load] bucket %d insert_all: existing=%d cap=%d->%d lf=%.2f"
+      "  new=%ld  target=%d  grows=%d\n",
+      bucket_idx, before_size, before_cap, bucket.capacity,
+      before_lf, (long)n, target, grows);
+
+  int64_t fail_count = 0;
   for (int64_t i = 0; i < n; ++i) {
     int32_t slot = start_slot + static_cast<int32_t>(i);
-    while (!buckets_[bucket_idx].insert(keys[i], slot)) {
-      buckets_[bucket_idx].grow();
+    if (!bucket.insert(keys[i], slot)) {
+      ++fail_count;
+      bucket.grow();
     }
+  }
+  if (fail_count > 0) {
+    std::fprintf(stderr,
+        "[load] bucket %d WARNING: %ld/%ld inserts needed extra grow"
+        " (final cap=%d)\n",
+        bucket_idx, (long)fail_count, (long)n, bucket.capacity);
   }
   return start_slot;
 }
