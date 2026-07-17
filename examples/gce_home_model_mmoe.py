@@ -533,7 +533,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     model.pred_model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.008)
-
+    resume_epoch = 0
     if args.resume:
         binary_path = args.resume.replace('.pt', '.hashemb')
         if os.path.exists(binary_path):
