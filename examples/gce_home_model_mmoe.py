@@ -693,7 +693,7 @@ def main():
               f"[{dt_save:.1f}s]", flush=True)
         print(f"  [SAVE] Writing dense model to {args.save} ...", flush=True)
         dense_ckpt = {
-            "dense": model.predict.state_dict(),
+            "dense": model.pred_model.state_dict(),
             "opt": optimizer.state_dict(),
             "epoch": resume_epoch + 1,
         }
