@@ -108,6 +108,26 @@ class PyHashEmbedding {
   }
   void load(const std::string& path) { table_.load(path); }
 
+  py::dict export_arrays() {
+    std::vector<int64_t> keys;
+    std::vector<float> embeddings;
+    table_.export_key_weight_arrays(keys, embeddings);
+
+    int64_t n = static_cast<int64_t>(keys.size());
+    int32_t D = table_.embedding_dim();
+
+    auto np_keys = py::array_t<int64_t>(static_cast<ssize_t>(n));
+    auto np_embeddings = make_float_array(n, D);
+
+    std::memcpy(np_keys.request().ptr, keys.data(), sizeof(int64_t) * n);
+    std::memcpy(np_embeddings.request().ptr, embeddings.data(), sizeof(float) * n * D);
+
+    py::dict d;
+    d["keys"] = np_keys;
+    d["embeddings"] = np_embeddings;
+    return d;
+  }
+
   // ── Serialisation ───────────────────────────────────────────────────
 
   py::dict state_dict() {
@@ -228,6 +248,7 @@ PYBIND11_MODULE(_hashemb_cpp, m) {
            py::arg("max_idle_steps") = 0,
            py::arg("combine") = "")
       .def("load", &hashemb::PyHashEmbedding::load, py::arg("path"))
+      .def("export_arrays", &hashemb::PyHashEmbedding::export_arrays)
 
       // Properties
       .def_property_readonly("capacity", &hashemb::PyHashEmbedding::capacity)

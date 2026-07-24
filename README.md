@@ -91,6 +91,7 @@ python examples/compare_ml1m.py
 ## 快速使用
 
 ```python
+import numpy as np
 import torch
 from hashemb import HashEmbedding
 
@@ -125,7 +126,17 @@ dense.load_state_dict(torch.load("dense.pt"))
 # 重新创建同规格 table，load 二进制文件
 emb = HashEmbedding(embedding_dim=64, capacity=10_000_000, optimizer="adam", lr=0.001)
 emb.load("emb.hashemb")
+
+# ── 导出用于 serving / inspection ───────────────────────────
+# 只包含 hash ID 和 float32 embedding vector，不包含 grad / Adam m,v / slots / stats
+emb.export("embeddings.npz")
+
+z = np.load("embeddings.npz")
+keys = z["keys"]
+vectors = z["embeddings"]
 ```
+
+`save()` 用于训练 checkpoint / resume；`export()` 用于外部消费，只写出 `(hash_id, embedding)`，导出顺序不保证稳定，消费侧应按 `keys` 对齐。
 
 ## 核心设计
 

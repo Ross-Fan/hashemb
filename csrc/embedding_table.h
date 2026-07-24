@@ -125,6 +125,10 @@ class EmbeddingTable {
   /// Supports VERSION=0 (no stats) and VERSION=1 (with stats).
   void load(const std::string& path);
 
+  /// Export only hash IDs and embedding vectors for serving/inspection.
+  void export_key_weight_arrays(std::vector<int64_t>& keys,
+                                std::vector<float>& embeddings) const;
+
   /// state_dict fields (pybind11 bridge expects numpy-compatible layout):
   ///   keys:       int64[ num_entries ]  — feat_id for each occupied slot
   ///   slots:      int32[ num_entries ]  — slot index

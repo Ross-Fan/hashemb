@@ -170,6 +170,29 @@ class HashEmbedding(torch.nn.Module):
         """
         self._table.load(path)
 
+    def export(self, path: str) -> int:
+        """Export hash IDs and embedding vectors to an NPZ file.
+
+        The export contains only serving/inspection data: ``keys`` and
+        ``embeddings``. It does not include gradients, optimizer state, slots,
+        or eviction stats.
+        """
+        if not str(path).endswith(".npz"):
+            raise ValueError("export path must end with '.npz'")
+
+        raw = self._table.export_arrays()
+        keys = raw["keys"].astype(np.int64, copy=False)
+        embeddings = raw["embeddings"].astype(np.float32, copy=False)
+        np.savez(
+            path,
+            keys=keys,
+            embeddings=embeddings,
+            dim=np.array(self.embedding_dim, dtype=np.int64),
+            num_entries=np.array(len(keys), dtype=np.int64),
+            format_version=np.array(1, dtype=np.int32),
+        )
+        return int(len(keys))
+
     def state_dict(self, *args, **kwargs):
         """Return the hash table state as a dict of CPU ``torch.Tensor``.
 

@@ -402,6 +402,24 @@ void EmbeddingTable::step() {
 // Serialisation
 // ===========================================================================
 
+void EmbeddingTable::export_key_weight_arrays(
+    std::vector<int64_t>& keys,
+    std::vector<float>& embeddings) const {
+  auto entries = hash_table_.dump();
+  int64_t n = static_cast<int64_t>(entries.size());
+  int32_t D = embedding_dim_;
+
+  keys.resize(n);
+  embeddings.resize(n * D);
+
+  for (int64_t i = 0; i < n; ++i) {
+    keys[i] = entries[i].first;
+    int32_t slot = entries[i].second;
+    std::memcpy(&embeddings[i * D], slot_ptr(emb_blocks_, slot, D, block_size_),
+                sizeof(float) * D);
+  }
+}
+
 void EmbeddingTable::state_dict_arrays(
     std::vector<int64_t>& keys,
     std::vector<int32_t>& slots,

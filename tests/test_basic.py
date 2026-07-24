@@ -230,6 +230,24 @@ class TestCppHashTable:
         w2 = t2.lookup(np.array([0], dtype=np.int32))
         assert np.allclose(w1, w2, atol=1e-5)
 
+    def test_export_arrays_key_weight_only(self):
+        table = _hashemb_cpp.HashEmbeddingTable(100, 4, optimizer="sgd", lr=0.1)
+        keys = np.array([10, 20, 30], dtype=np.int64)
+        _, slots = table.lookup_and_gather(keys)
+        table.scatter_add_grad(slots, np.ones((3, 4), dtype=np.float32))
+        table.step()
+
+        exported = table.export_arrays()
+        assert set(exported.keys()) == {"keys", "embeddings"}
+        assert exported["keys"].dtype == np.int64
+        assert exported["embeddings"].dtype == np.float32
+        assert exported["embeddings"].shape == (3, 4)
+
+        expected = table.lookup(slots)
+        by_key = {int(k): v for k, v in zip(exported["keys"], exported["embeddings"])}
+        for key, vector in zip(keys, expected):
+            assert np.allclose(by_key[int(key)], vector, atol=1e-6)
+
 
 # ===========================================================================
 # PyTorch Wrapper Tests (device-agnostic: CUDA > MPS > skip)
@@ -346,6 +364,41 @@ class TestHashEmbeddingCPU:
         out1 = emb(keys)
         out2 = emb2(keys)
         assert torch.allclose(out1, out2, atol=1e-6)
+
+    def test_export_npz(self, tmp_path):
+        """Export only hash IDs and embedding vectors for serving/inspection."""
+        from hashemb import HashEmbedding
+
+        emb = HashEmbedding(4, 100, optimizer="sgd", lr=0.1)
+        keys = torch.tensor([10, 20, 30], dtype=torch.int64, device=DEVICE)
+        out = emb(keys)
+        out.sum().backward()
+        emb.step()
+
+        path = tmp_path / "embeddings.npz"
+        count = emb.export(path)
+        assert count == 3
+        assert emb.num_entries == 3
+
+        z = np.load(path)
+        assert set(z.files) == {"keys", "embeddings", "dim", "num_entries", "format_version"}
+        assert z["keys"].dtype == np.int64
+        assert z["embeddings"].dtype == np.float32
+        assert z["embeddings"].shape == (3, 4)
+        assert z["dim"].dtype == np.int64
+        assert z["num_entries"].dtype == np.int64
+        assert z["format_version"].dtype == np.int32
+        assert int(z["dim"]) == 4
+        assert int(z["num_entries"]) == 3
+        assert int(z["format_version"]) == 1
+
+        expected = emb(keys).detach().cpu().numpy()
+        by_key = {int(k): v for k, v in zip(z["keys"], z["embeddings"])}
+        for key, vector in zip(keys.cpu().numpy(), expected):
+            assert np.allclose(by_key[int(key)], vector, atol=1e-6)
+
+        with pytest.raises(ValueError, match="\\.npz"):
+            emb.export(tmp_path / "embeddings")
 
 
 if __name__ == "__main__":
