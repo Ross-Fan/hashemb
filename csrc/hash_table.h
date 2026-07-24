@@ -10,6 +10,8 @@
 namespace hashemb {
 
 constexpr int kNumBuckets = 16;
+constexpr int32_t kMaxLoadNumerator = 3;
+constexpr int32_t kMaxLoadDenominator = 4;  // grow before load factor exceeds 0.75
 
 /// Per-bucket data for Robin Hood open-addressing hash map.
 struct Bucket {
@@ -30,6 +32,7 @@ struct Bucket {
   bool insert(int64_t key, int32_t slot_idx);
   int32_t* find(int64_t key);
   void grow();  // double capacity and rehash all entries
+  bool has_insert_capacity(int64_t additional = 1) const;
 };
 
 /// 16-way sharded hash map: feat_id → slot_index.

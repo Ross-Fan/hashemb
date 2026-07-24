@@ -19,7 +19,7 @@ void Bucket::allocate(int32_t cap) {
 }
 
 bool Bucket::insert(int64_t key, int32_t slot_idx) {
-  if (size >= capacity) return false;
+  if (!has_insert_capacity()) return false;
 
   int32_t mask = capacity - 1;
   int32_t home = static_cast<int32_t>(key) & mask;
@@ -52,6 +52,11 @@ bool Bucket::insert(int64_t key, int32_t slot_idx) {
     ++curr_dist;
     idx = (home + probe_dist) & mask;
   }
+}
+
+bool Bucket::has_insert_capacity(int64_t additional) const {
+  return (static_cast<int64_t>(size) + additional) * kMaxLoadDenominator <=
+         static_cast<int64_t>(capacity) * kMaxLoadNumerator;
 }
 
 void Bucket::grow() {
@@ -127,9 +132,10 @@ int32_t* Bucket::find(int64_t key) {
 HashTable::HashTable(int64_t initial_capacity_hint) {
   // Per-bucket capacity = ceil(initial_capacity_hint / 16), rounded to power-of-2.
   int64_t per_bucket = (initial_capacity_hint + kNumBuckets - 1) / kNumBuckets;
-  // Add 25% slack to keep load factor ≤ 0.8.
-  per_bucket = static_cast<int64_t>(per_bucket * 1.25) + 1;
-  per_bucket = next_pow2(static_cast<int32_t>(per_bucket));
+  // Size for target max load factor.
+  per_bucket = (per_bucket * kMaxLoadDenominator + kMaxLoadNumerator - 1) /
+               kMaxLoadNumerator;
+  per_bucket = next_pow2(static_cast<int32_t>(per_bucket + 1));
 
   for (int i = 0; i < kNumBuckets; ++i) {
     buckets_[i].allocate(static_cast<int32_t>(per_bucket));
@@ -276,9 +282,12 @@ int32_t HashTable::insert_all(int bucket_idx, const int64_t* keys, int64_t n) {
   int32_t before_cap  = bucket.capacity;
   double before_lf = before_cap > 0 ? (double)before_size / before_cap : 0.0;
 
-  // Pre-grow to final capacity to avoid per-insert grow/rehash
+  // Pre-grow to final capacity to avoid per-insert grow/rehash.
   int32_t needed = bucket.size + static_cast<int32_t>(n);
-  int32_t target = next_pow2(static_cast<int32_t>(needed * 1.25 + 1));
+  int64_t target_cells =
+      (static_cast<int64_t>(needed) * kMaxLoadDenominator + kMaxLoadNumerator - 1) /
+      kMaxLoadNumerator;
+  int32_t target = next_pow2(static_cast<int32_t>(target_cells + 1));
   int32_t grows = 0;
   while (bucket.capacity < target) {
     bucket.grow();
