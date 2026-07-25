@@ -278,6 +278,17 @@ void EmbeddingTable::lookup_and_gather(const int64_t* keys, float* output,
   lookup(slot_indices, output, n);
 }
 
+void EmbeddingTable::lookup_existing(const int64_t* keys, float* output, int64_t n) const {
+  int32_t D = embedding_dim_;
+
+  // Find existing keys (-1 for unknown).
+  std::vector<int32_t> slots(static_cast<size_t>(n));
+  hash_table_.find_only(keys, slots.data(), n);
+
+  // lookup already handles slot < 0 as zeros.
+  lookup(slots.data(), output, n);
+}
+
 // ===========================================================================
 // Gradient accumulation
 // ===========================================================================

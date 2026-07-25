@@ -80,7 +80,7 @@ class HashEmbedding(torch.nn.Module):
                  beta1: float = 0.9, beta2: float = 0.999,
                  eps: float = 1e-8,
                  block_size: int = 1_000_000,
-                 initial_scale: float = 0.0):
+                 initial_scale: float = 0.1):
         super().__init__()
         if embedding_dim < 1:
             raise ValueError("embedding_dim must be ≥ 1")
@@ -109,6 +109,9 @@ class HashEmbedding(torch.nn.Module):
     def forward(self, keys: torch.Tensor) -> torch.Tensor:
         """Lookup embeddings for keys.
 
+        In training mode, unknown keys create new entries.  In eval mode,
+        unknown keys return zero vectors and **do not** create entries.
+
         Args:
             keys: int64 tensor, shape (...,) with rank ≤ 3.
 
@@ -119,9 +122,17 @@ class HashEmbedding(torch.nn.Module):
         dev = keys.device
         keys_flat = keys.contiguous().view(-1).cpu()
 
-        emb_cpu = HashEmbeddingFunction.apply(
-            keys_flat, self._table, self.lr, self._flow.cpu(),
-        )
+        if self.training:
+            emb_cpu = HashEmbeddingFunction.apply(
+                keys_flat, self._table, self.lr, self._flow.cpu(),
+            )
+        else:
+            # Eval: lookup only, zeros for unknown keys, no autograd,
+            # no table insertion.
+            with torch.no_grad():
+                keys_np = keys_flat.numpy()
+                emb_np = self._table.lookup_existing(keys_np)
+                emb_cpu = torch.from_numpy(emb_np)
 
         out_shape = orig_shape + (self.embedding_dim,)
         return emb_cpu.to(dev).view(out_shape)

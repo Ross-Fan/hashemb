@@ -59,6 +59,18 @@ class PyHashEmbedding {
     return py::make_tuple(embeddings, slot_indices);
   }
 
+  py::array_t<float> lookup_existing(py::array_t<int64_t> keys) {
+    py::buffer_info buf = keys.request();
+    int64_t n = buf.shape[0];
+    auto* keys_ptr = static_cast<const int64_t*>(buf.ptr);
+
+    auto embeddings = make_float_array(n, table_.embedding_dim());
+    auto* emb_ptr = static_cast<float*>(embeddings.request().ptr);
+
+    table_.lookup_existing(keys_ptr, emb_ptr, n);
+    return embeddings;
+  }
+
   py::array_t<int32_t> find_or_create(py::array_t<int64_t> keys) {
     py::buffer_info buf = keys.request();
     int64_t n = buf.shape[0];
@@ -244,6 +256,8 @@ PYBIND11_MODULE(_hashemb_cpp, m) {
            py::arg("keys"))
       .def("lookup", &hashemb::PyHashEmbedding::lookup,
            py::arg("slot_indices"))
+      .def("lookup_existing", &hashemb::PyHashEmbedding::lookup_existing,
+           py::arg("keys"))
 
       // Optimizer
       .def("scatter_add_grad", &hashemb::PyHashEmbedding::scatter_add_grad,

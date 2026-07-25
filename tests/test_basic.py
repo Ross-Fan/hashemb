@@ -314,7 +314,8 @@ class TestHashEmbeddingCPU:
     def test_backward_gradient_sum(self):
         """Same feat_id → gradients summed, then step() applies."""
         from hashemb import HashEmbedding
-        emb = HashEmbedding(embedding_dim=4, capacity=100, optimizer="sgd", lr=0.1)
+        emb = HashEmbedding(embedding_dim=4, capacity=100, optimizer="sgd", lr=0.1,
+                            initial_scale=0.0)
 
         keys = torch.tensor([99, 99, 1], dtype=torch.int64, device=DEVICE)
         out = emb(keys)
@@ -332,7 +333,8 @@ class TestHashEmbeddingCPU:
     def test_multi_step_accumulate(self):
         """Multiple backward passes before single step() accumulate grads."""
         from hashemb import HashEmbedding
-        emb = HashEmbedding(4, 100, optimizer="sgd", lr=0.1)
+        emb = HashEmbedding(4, 100, optimizer="sgd", lr=0.1,
+                            initial_scale=0.0)
 
         keys = torch.tensor([99], dtype=torch.int64, device=DEVICE)
 

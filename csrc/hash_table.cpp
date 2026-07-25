@@ -109,7 +109,7 @@ void Bucket::grow() {
   // size stays the same
 }
 
-int32_t* Bucket::find(int64_t key) {
+const int32_t* Bucket::find(int64_t key) const {
   int32_t mask = capacity - 1;
   int32_t home = static_cast<int32_t>(key) & mask;
   int32_t idx = home;
@@ -184,7 +184,7 @@ int64_t HashTable::find_or_create(const int64_t* keys, int32_t* slot_indices, in
         auto it = key_to_slot.find(ik.key);
         if (it != key_to_slot.end()) continue;  // dedup
 
-        int32_t* found = buckets_[b].find(ik.key);
+        const int32_t* found = buckets_[b].find(ik.key);
         if (found) {
           key_to_slot[ik.key] = *found;
         } else {
@@ -199,7 +199,7 @@ int64_t HashTable::find_or_create(const int64_t* keys, int32_t* slot_indices, in
       std::unique_lock lock(buckets_[b].mtx);
       for (int64_t key : pending_inserts) {
         // Double-check (another thread may have inserted between passes)
-        int32_t* found = buckets_[b].find(key);
+        const int32_t* found = buckets_[b].find(key);
         if (found) {
           key_to_slot[key] = *found;
           continue;
@@ -223,6 +223,20 @@ int64_t HashTable::find_or_create(const int64_t* keys, int32_t* slot_indices, in
   }
 
   return new_count;
+}
+
+void HashTable::find_only(const int64_t* keys, int32_t* slot_indices, int64_t n) const {
+  for (int64_t i = 0; i < n; ++i) {
+    int64_t key = keys[i];
+    if (key < 0) {
+      slot_indices[i] = -1;
+      continue;
+    }
+    int b = static_cast<int>(key & 0xF);
+    std::shared_lock lock(buckets_[b].mtx);
+    const int32_t* found = buckets_[b].find(key);
+    slot_indices[i] = found ? *found : -1;
+  }
 }
 
 std::vector<std::pair<int64_t, int32_t>> HashTable::dump() const {
@@ -260,7 +274,7 @@ int64_t HashTable::bulk_insert(const int64_t* keys, const int32_t* slots,
     int b = static_cast<int>(key & 0xF);
     std::unique_lock lock(buckets_[b].mtx);
     // Only insert if key doesn't already exist (idempotent load).
-    int32_t* found = buckets_[b].find(key);
+    const int32_t* found = buckets_[b].find(key);
     if (found) continue;
     // Auto-grow if full and retry.
     while (!buckets_[b].insert(key, slot)) {

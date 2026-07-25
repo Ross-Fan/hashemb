@@ -96,6 +96,9 @@ class EmbeddingTable {
   void lookup_and_gather(const int64_t* keys, float* output,
                          int32_t* slot_indices, int64_t n);
 
+  /// Lookup existing keys only; outputs zeros for unknown keys. Does NOT create entries.
+  void lookup_existing(const int64_t* keys, float* output, int64_t n) const;
+
   // ── Gradient accumulation (called by autograd backward) ─────────────
 
   void scatter_add_grad(const int32_t* slot_indices, const float* grads,

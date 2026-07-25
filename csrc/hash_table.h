@@ -30,7 +30,7 @@ struct Bucket {
 
   void allocate(int32_t cap);
   bool insert(int64_t key, int32_t slot_idx);
-  int32_t* find(int64_t key);
+  const int32_t* find(int64_t key) const;
   void grow();  // double capacity and rehash all entries
   bool has_insert_capacity(int64_t additional = 1) const;
 };
@@ -46,6 +46,9 @@ class HashTable {
   HashTable& operator=(const HashTable&) = delete;
 
   int64_t find_or_create(const int64_t* keys, int32_t* slot_indices, int64_t n);
+
+  /// Find existing keys without creating.  Unknown keys → slot_indices[i] = -1.
+  void find_only(const int64_t* keys, int32_t* slot_indices, int64_t n) const;
 
   /// Get all (key, slot_index) pairs currently stored.
   std::vector<std::pair<int64_t, int32_t>> dump() const;
