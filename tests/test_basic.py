@@ -248,6 +248,32 @@ class TestCppHashTable:
         for key, vector in zip(keys, expected):
             assert np.allclose(by_key[int(key)], vector, atol=1e-6)
 
+    def test_export_bucket_arrays_key_weight_only(self):
+        table = _hashemb_cpp.HashEmbeddingTable(100, 4, optimizer="sgd", lr=0.1)
+        keys = np.array([0, 1, 15, 16, 31], dtype=np.int64)
+        _, slots = table.lookup_and_gather(keys)
+        table.scatter_add_grad(slots, np.ones((5, 4), dtype=np.float32))
+        table.step()
+
+        expected = table.lookup(slots)
+        expected_by_key = {int(k): v for k, v in zip(keys, expected)}
+
+        for bucket_id in (0, 1, 15):
+            exported = table.export_bucket_arrays(bucket_id)
+            assert set(exported.keys()) == {"keys", "embeddings"}
+            assert exported["keys"].dtype == np.int64
+            assert exported["embeddings"].dtype == np.float32
+            assert exported["embeddings"].shape == (len(exported["keys"]), 4)
+
+            for key, vector in zip(exported["keys"], exported["embeddings"]):
+                assert (int(key) & 0xF) == bucket_id
+                assert np.allclose(vector, expected_by_key[int(key)], atol=1e-6)
+
+        with pytest.raises(Exception, match="bucket_idx"):
+            table.export_bucket_arrays(-1)
+        with pytest.raises(Exception, match="bucket_idx"):
+            table.export_bucket_arrays(16)
+
 
 # ===========================================================================
 # PyTorch Wrapper Tests (device-agnostic: CUDA > MPS > skip)
@@ -366,34 +392,65 @@ class TestHashEmbeddingCPU:
         assert torch.allclose(out1, out2, atol=1e-6)
 
     def test_export_npz(self, tmp_path):
-        """Export only hash IDs and embedding vectors for serving/inspection."""
+        """Export bucket-sharded hash IDs and embedding vectors."""
         from hashemb import HashEmbedding
 
         emb = HashEmbedding(4, 100, optimizer="sgd", lr=0.1)
-        keys = torch.tensor([10, 20, 30], dtype=torch.int64, device=DEVICE)
+        keys = torch.tensor([0, 1, 15, 16, 31], dtype=torch.int64, device=DEVICE)
         out = emb(keys)
         out.sum().backward()
         emb.step()
 
         path = tmp_path / "embeddings.npz"
         count = emb.export(path)
-        assert count == 3
-        assert emb.num_entries == 3
+        assert count == emb.num_entries == 5
+        assert not path.exists()
 
-        z = np.load(path)
-        assert set(z.files) == {"keys", "embeddings", "dim", "num_entries", "format_version"}
-        assert z["keys"].dtype == np.int64
-        assert z["embeddings"].dtype == np.float32
-        assert z["embeddings"].shape == (3, 4)
-        assert z["dim"].dtype == np.int64
-        assert z["num_entries"].dtype == np.int64
-        assert z["format_version"].dtype == np.int32
-        assert int(z["dim"]) == 4
-        assert int(z["num_entries"]) == 3
-        assert int(z["format_version"]) == 1
+        by_key = {}
+        total = 0
+        empty_bucket_seen = False
+        expected_fields = {
+            "keys", "embeddings", "dim", "num_entries", "format_version",
+            "bucket_id", "num_buckets",
+        }
+
+        for bucket_id in range(16):
+            bucket_path = tmp_path / f"embeddings_bucket_{bucket_id:02d}.npz"
+            assert bucket_path.exists()
+
+            with np.load(bucket_path) as z:
+                assert set(z.files) == expected_fields
+                assert z["keys"].dtype == np.int64
+                assert z["embeddings"].dtype == np.float32
+                assert z["dim"].dtype == np.int64
+                assert z["num_entries"].dtype == np.int64
+                assert z["format_version"].dtype == np.int32
+                assert z["bucket_id"].dtype == np.int32
+                assert z["num_buckets"].dtype == np.int32
+                assert int(z["dim"]) == 4
+                assert int(z["format_version"]) == 2
+                assert int(z["bucket_id"]) == bucket_id
+                assert int(z["num_buckets"]) == 16
+
+                bucket_keys = z["keys"]
+                embeddings = z["embeddings"]
+                assert int(z["num_entries"]) == len(bucket_keys)
+                assert embeddings.shape == (len(bucket_keys), 4)
+                total += len(bucket_keys)
+
+                if len(bucket_keys) == 0:
+                    empty_bucket_seen = True
+                    assert bucket_keys.shape == (0,)
+                    assert embeddings.shape == (0, 4)
+
+                for key, vector in zip(bucket_keys, embeddings):
+                    assert (int(key) & 0xF) == bucket_id
+                    by_key[int(key)] = vector
+
+        assert total == count
+        assert empty_bucket_seen
 
         expected = emb(keys).detach().cpu().numpy()
-        by_key = {int(k): v for k, v in zip(z["keys"], z["embeddings"])}
         for key, vector in zip(keys.cpu().numpy(), expected):
             assert np.allclose(by_key[int(key)], vector, atol=1e-6)
 

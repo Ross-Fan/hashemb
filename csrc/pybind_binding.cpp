@@ -113,19 +113,15 @@ class PyHashEmbedding {
     std::vector<float> embeddings;
     table_.export_key_weight_arrays(keys, embeddings);
 
-    int64_t n = static_cast<int64_t>(keys.size());
-    int32_t D = table_.embedding_dim();
+    return make_export_dict(keys, embeddings);
+  }
 
-    auto np_keys = py::array_t<int64_t>(static_cast<ssize_t>(n));
-    auto np_embeddings = make_float_array(n, D);
+  py::dict export_bucket_arrays(int bucket_idx) {
+    std::vector<int64_t> keys;
+    std::vector<float> embeddings;
+    table_.export_bucket_key_weight_arrays(bucket_idx, keys, embeddings);
 
-    std::memcpy(np_keys.request().ptr, keys.data(), sizeof(int64_t) * n);
-    std::memcpy(np_embeddings.request().ptr, embeddings.data(), sizeof(float) * n * D);
-
-    py::dict d;
-    d["keys"] = np_keys;
-    d["embeddings"] = np_embeddings;
-    return d;
+    return make_export_dict(keys, embeddings);
   }
 
   // ── Serialisation ───────────────────────────────────────────────────
@@ -204,6 +200,25 @@ class PyHashEmbedding {
     std::vector<ssize_t> shape = {static_cast<ssize_t>(n), static_cast<ssize_t>(d)};
     return py::array_t<float>(shape);
   }
+
+  py::dict make_export_dict(const std::vector<int64_t>& keys,
+                            const std::vector<float>& embeddings) const {
+    int64_t n = static_cast<int64_t>(keys.size());
+    int32_t D = table_.embedding_dim();
+
+    auto np_keys = py::array_t<int64_t>(static_cast<ssize_t>(n));
+    auto np_embeddings = make_float_array(n, D);
+
+    if (n > 0) {
+      std::memcpy(np_keys.request().ptr, keys.data(), sizeof(int64_t) * n);
+      std::memcpy(np_embeddings.request().ptr, embeddings.data(), sizeof(float) * n * D);
+    }
+
+    py::dict d;
+    d["keys"] = np_keys;
+    d["embeddings"] = np_embeddings;
+    return d;
+  }
 };
 
 }  // namespace hashemb
@@ -249,6 +264,8 @@ PYBIND11_MODULE(_hashemb_cpp, m) {
            py::arg("combine") = "")
       .def("load", &hashemb::PyHashEmbedding::load, py::arg("path"))
       .def("export_arrays", &hashemb::PyHashEmbedding::export_arrays)
+      .def("export_bucket_arrays", &hashemb::PyHashEmbedding::export_bucket_arrays,
+           py::arg("bucket_idx"))
 
       // Properties
       .def_property_readonly("capacity", &hashemb::PyHashEmbedding::capacity)
