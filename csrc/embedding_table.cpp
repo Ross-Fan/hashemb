@@ -297,6 +297,7 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
                                       const float* grads,
                                       int64_t n) {
   int32_t D = embedding_dim_;
+  int64_t bs = block_size_;
 
   // Ensure blocks for all referenced slots.
   int32_t max_slot = -1;
@@ -305,22 +306,59 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
   }
   if (max_slot >= 0) ensure_slot(max_slot);
 
-  // Direct accumulation into grad_blocks_; mark dirty slots inline.
-  // slot_dirty_ is already sized to cover all valid slots (via ensure_slot
-  // above), so we skip the unordered_map and use it directly for dedup.
+  // ── Fast path: small batch, direct loop ──────────────────────
+  // Skip the grouping overhead when the batch is too small to benefit
+  // from parallelism (no duplicate races to worry about in practice).
+  if (n < 4096) {
+    for (int64_t i = 0; i < n; ++i) {
+      int32_t slot = slot_indices[i];
+      if (slot < 0) continue;
+
+      float* grad_dst = slot_ptr(grad_blocks_, slot, D, bs);
+      const float* g = grads + i * D;
+      for (int32_t d = 0; d < D; ++d) grad_dst[d] += g[d];
+
+      if (!slot_dirty_[slot]) {
+        slot_dirty_[slot] = true;
+        dirty_slots_.push_back(slot);
+      }
+    }
+    return;
+  }
+
+  // ── Single-thread: dedup by slot, track dirty slots ────────────
+  // Group indices by slot so the parallel pass has no data races
+  // (different slots write to disjoint grad_blocks_ regions).
+  std::unordered_map<int32_t, std::vector<int64_t>> groups;
+  groups.reserve(static_cast<size_t>(n) / 4 + 16);
   for (int64_t i = 0; i < n; ++i) {
     int32_t slot = slot_indices[i];
     if (slot < 0) continue;
-
-    float* grad_dst = slot_ptr(grad_blocks_, slot, D, block_size_);
-    const float* g = grads + i * D;
-    for (int32_t d = 0; d < D; ++d) grad_dst[d] += g[d];
+    groups[slot].push_back(i);
 
     if (!slot_dirty_[slot]) {
       slot_dirty_[slot] = true;
       dirty_slots_.push_back(slot);
     }
   }
+
+  // ── Parallel: accumulate deduped gradients per slot ────────────
+  // Move groups into a vector for O(1) parallel indexing; each slot
+  // is independent so parallel_for is safe.
+  std::vector<std::pair<int32_t, std::vector<int64_t>>> items;
+  items.reserve(groups.size());
+  for (auto& kv : groups) {
+    items.emplace_back(std::move(kv.first), std::move(kv.second));
+  }
+
+  ThreadPool::instance().parallel_for(items.size(), [&](size_t idx) {
+    int32_t slot = items[idx].first;
+    float* dst = slot_ptr(grad_blocks_, slot, D, bs);
+    for (int64_t i : items[idx].second) {
+      const float* g = grads + i * D;
+      for (int32_t d = 0; d < D; ++d) dst[d] += g[d];
+    }
+  });
 }
 
 // ===========================================================================
