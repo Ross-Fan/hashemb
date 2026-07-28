@@ -305,73 +305,22 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
   }
   if (max_slot >= 0) ensure_slot(max_slot);
 
-  // ── Fast path: small batch, direct loop ──────────────────────
-  // Skip the grouping overhead when the batch is too small to benefit
-  // from parallelism.
-  if (n < 4096) {
-    for (int64_t i = 0; i < n; ++i) {
-      int32_t slot = slot_indices[i];
-      if (slot < 0) continue;
-
-      float* grad_dst = slot_ptr(grad_blocks_, slot, D, bs);
-      const float* g = grads + i * D;
-      for (int32_t d = 0; d < D; ++d) grad_dst[d] += g[d];
-
-      if (!slot_dirty_[slot]) {
-        slot_dirty_[slot] = true;
-        dirty_slots_.push_back(slot);
-      }
-    }
-    return;
-  }
-
-  // ── Large batch: sort by slot, then parallel by unique slot ──
-
-  // Build (slot, batch_index) pairs, skipping negative slots.
-  std::vector<std::pair<int32_t, int64_t>> pairs;
-  pairs.reserve(static_cast<size_t>(n));
+  // Single-threaded: simple loop, no sorting/grouping overhead.
+  // This operation is memory-bandwidth bound (random DDR writes),
+  // so parallelisation does not help — it only adds overhead.
   for (int64_t i = 0; i < n; ++i) {
-    if (slot_indices[i] >= 0) {
-      pairs.emplace_back(slot_indices[i], i);
+    int32_t slot = slot_indices[i];
+    if (slot < 0) continue;
+
+    float* grad_dst = slot_ptr(grad_blocks_, slot, D, bs);
+    const float* g = grads + i * D;
+    for (int32_t d = 0; d < D; ++d) grad_dst[d] += g[d];
+
+    if (!slot_dirty_[slot]) {
+      slot_dirty_[slot] = true;
+      dirty_slots_.push_back(slot);
     }
   }
-
-  // Sort by slot to group duplicate slots together.
-  std::sort(pairs.begin(), pairs.end());
-
-  if (pairs.empty()) return;
-
-  // Collect unique slot ranges: (slot, start_index_in_pairs).
-  // Also track dirty slots (only at slot boundaries = O(unique_slots)).
-  std::vector<std::pair<int32_t, int64_t>> ranges;
-  ranges.reserve(pairs.size() / 4 + 16);
-  ranges.emplace_back(pairs[0].first, 0);
-  slot_dirty_[pairs[0].first] = true;
-  dirty_slots_.push_back(pairs[0].first);
-
-  for (size_t i = 1; i < pairs.size(); ++i) {
-    if (pairs[i].first != pairs[i - 1].first) {
-      ranges.emplace_back(pairs[i].first, i);
-      slot_dirty_[pairs[i].first] = true;
-      dirty_slots_.push_back(pairs[i].first);
-    }
-  }
-
-  // Parallel: accumulate gradients per unique slot.
-  // Each slot writes to a disjoint grad_blocks_ region — no data races.
-  ThreadPool::instance().parallel_for(ranges.size(), [&](size_t ri) {
-    int32_t slot = ranges[ri].first;
-    float* dst = slot_ptr(grad_blocks_, slot, D, bs);
-    int64_t start = ranges[ri].second;
-    int64_t end = (ri + 1 < ranges.size())
-                      ? ranges[ri + 1].second
-                      : static_cast<int64_t>(pairs.size());
-
-    for (int64_t j = start; j < end; ++j) {
-      const float* g = grads + pairs[j].second * D;
-      for (int32_t d = 0; d < D; ++d) dst[d] += g[d];
-    }
-  });
 }
 
 // ===========================================================================
