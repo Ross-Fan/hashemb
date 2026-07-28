@@ -128,9 +128,11 @@ emb = HashEmbedding(embedding_dim=64, capacity=10_000_000, optimizer="adam", lr=
 emb.load("emb.hashemb")
 
 # ── 导出用于 serving / inspection ───────────────────────────
-# 只包含 hash ID 和 float32 embedding vector，不包含 grad / Adam m,v / slots / stats
+# 从已保存的 checkpoint 中提取 keys 和 embeddings 到 NPZ 文件
 # 写出 embeddings_bucket_00.npz ... embeddings_bucket_15.npz
-emb.export("embeddings.npz")
+from hashemb.utils import export_hashemb_to_npz
+
+export_hashemb_to_npz("emb.hashemb", "embeddings.npz", embedding_dim=64, capacity=10_000_000)
 
 embedding_by_key = {}
 for bucket_id in range(16):
@@ -139,7 +141,7 @@ for bucket_id in range(16):
         embedding_by_key[int(key)] = vector
 ```
 
-`save()` 用于训练 checkpoint / resume；`export()` 用于外部消费，只写出 `(hash_id, embedding)`。调用 `export("embeddings.npz")` 会按 16 个 hash bucket 分别写出 `embeddings_bucket_00.npz` 到 `embeddings_bucket_15.npz`，避免一次性物化全表导致 OOM。每个 bucket 文件只包含 key/vector 数据和基础 metadata，导出顺序不保证稳定，消费侧应按 `keys` 对齐。
+`save()` 用于训练 checkpoint / resume；`export_hashemb_to_npz()` 用于从已保存的 checkpoint 中导出 NPZ，只写出 `(hash_id, embedding)`。调用后会按 16 个 hash bucket 分别写出 `embeddings_bucket_00.npz` 到 `embeddings_bucket_15.npz`，避免一次性物化全表导致 OOM。每个 bucket 文件只包含 key/vector 数据和基础 metadata，导出顺序不保证稳定，消费侧应按 `keys` 对齐。
 
 ## 核心设计
 

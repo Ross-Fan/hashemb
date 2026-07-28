@@ -2,7 +2,6 @@
 
 import torch
 import numpy as np
-from pathlib import Path
 from . import _hashemb_cpp
 
 
@@ -181,40 +180,6 @@ class HashEmbedding(torch.nn.Module):
             path: File path to read.
         """
         self._table.load(path)
-
-    def export(self, path: str) -> int:
-        """Export hash IDs and embedding vectors to bucket-sharded NPZ files.
-
-        Calling ``export("embeddings.npz")`` writes ``embeddings_bucket_00.npz``
-        through ``embeddings_bucket_15.npz``. Each file contains only serving /
-        inspection data: ``keys`` and ``embeddings`` plus metadata. It does not
-        include gradients, optimizer state, slots, or eviction stats.
-        """
-        if not str(path).endswith(".npz"):
-            raise ValueError("export path must end with '.npz'")
-
-        base = Path(path)
-        total = 0
-        num_buckets = 16
-        for bucket_id in range(num_buckets):
-            raw = self._table.export_bucket_arrays(bucket_id)
-            keys = raw["keys"].astype(np.int64, copy=False)
-            embeddings = raw["embeddings"].astype(np.float32, copy=False)
-            bucket_path = base.with_name(
-                f"{base.stem}_bucket_{bucket_id:02d}{base.suffix}"
-            )
-            np.savez(
-                bucket_path,
-                keys=keys,
-                embeddings=embeddings,
-                dim=np.array(self.embedding_dim, dtype=np.int64),
-                num_entries=np.array(len(keys), dtype=np.int64),
-                format_version=np.array(2, dtype=np.int32),
-                bucket_id=np.array(bucket_id, dtype=np.int32),
-                num_buckets=np.array(num_buckets, dtype=np.int32),
-            )
-            total += int(len(keys))
-        return total
 
     def state_dict(self, *args, **kwargs):
         """Return the hash table state as a dict of CPU ``torch.Tensor``.

@@ -394,8 +394,9 @@ class TestHashEmbeddingCPU:
         assert torch.allclose(out1, out2, atol=1e-6)
 
     def test_export_npz(self, tmp_path):
-        """Export bucket-sharded hash IDs and embedding vectors."""
+        """Export bucket-sharded hash IDs and embedding vectors via utility."""
         from hashemb import HashEmbedding
+        from hashemb.utils import export_hashemb_to_npz
 
         emb = HashEmbedding(4, 100, optimizer="sgd", lr=0.1)
         keys = torch.tensor([0, 1, 15, 16, 31], dtype=torch.int64, device=DEVICE)
@@ -403,10 +404,16 @@ class TestHashEmbeddingCPU:
         out.sum().backward()
         emb.step()
 
-        path = tmp_path / "embeddings.npz"
-        count = emb.export(path)
+        save_path = tmp_path / "table.hashemb"
+        emb.save(str(save_path))
+
+        npz_path = tmp_path / "embeddings.npz"
+        count = export_hashemb_to_npz(
+            str(save_path), str(npz_path),
+            embedding_dim=4, capacity=100,
+        )
         assert count == emb.num_entries == 5
-        assert not path.exists()
+        assert not npz_path.exists()
 
         by_key = {}
         total = 0
@@ -457,7 +464,10 @@ class TestHashEmbeddingCPU:
             assert np.allclose(by_key[int(key)], vector, atol=1e-6)
 
         with pytest.raises(ValueError, match="\\.npz"):
-            emb.export(tmp_path / "embeddings")
+            export_hashemb_to_npz(
+                str(save_path), str(tmp_path / "bad_output"),
+                embedding_dim=4, capacity=100,
+            )
 
 
 if __name__ == "__main__":
