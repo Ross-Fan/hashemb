@@ -53,7 +53,12 @@ struct SlotStats {
 };
 
 /// Get pointer to slot `slot_id` within a block vector using given block_size.
+/// Fast path: when only one block exists (common for tables < block_size),
+/// skip the division/modulo and use direct pointer arithmetic.
 inline float* slot_ptr(const std::vector<Block>& blocks, int64_t slot_id, int32_t D, int64_t block_size) {
+  if (blocks.size() == 1) {
+    return blocks[0].data + slot_id * D;
+  }
   int64_t block_id = slot_id / block_size;
   int64_t offset = slot_id % block_size;
   return blocks[block_id].data + offset * D;

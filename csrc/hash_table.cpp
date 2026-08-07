@@ -1,9 +1,11 @@
 #include "hash_table.h"
+#include "thread_pool.h"
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace hashemb {
 
@@ -143,8 +145,6 @@ HashTable::HashTable(int64_t initial_capacity_hint) {
 }
 
 int64_t HashTable::find_or_create(const int64_t* keys, int32_t* slot_indices, int64_t n) {
-  int64_t new_count = 0;
-
   // ── Step 1: Partition keys by bucket ─────────────────────────────
   // bucket_groups[b] = vector of (original_index, key) for keys that
   // hash to bucket b.  Negative keys are handled inline.
@@ -164,68 +164,93 @@ int64_t HashTable::find_or_create(const int64_t* keys, int32_t* slot_indices, in
     bucket_groups[b].push_back({i, key});
   }
 
-  // ── Step 2: Process each bucket with single lock acquire ─────────
-  for (int b = 0; b < kNumBuckets; ++b) {
+  // ── Step 2: Process each bucket in parallel ─────────────────────
+  // Each bucket has its own mutex, so 16 buckets can be processed
+  // concurrently.  slot_indices[] writes are non-overlapping (each key
+  // hashes to exactly one bucket).  num_entries_ is already atomic.
+  std::atomic<int64_t> new_count{0};
+
+  ThreadPool::instance().parallel_for(kNumBuckets, [&](size_t b) {
     auto& group = bucket_groups[b];
-    if (group.empty()) continue;
+    if (group.empty()) return;
 
-    // key_to_slot: maps key → slot_index.
-    // slot = -1 means "key not in hash table, needs insertion".
-    std::unordered_map<int64_t, int32_t> key_to_slot;
-    key_to_slot.reserve(group.size());
+    // Sort by key to group duplicates together (replaces unordered_map
+    // dedup — avoids per-key heap node allocation).
+    std::sort(group.begin(), group.end(),
+              [](const IndexedKey& a, const IndexedKey& b) {
+                return a.key < b.key;
+              });
 
-    // Which unique keys need to be inserted (slot = -1 in map).
-    std::vector<int64_t> pending_inserts;
+    // Build unique-key ranges: each range covers all entries in group[]
+    // that share the same key.  slot is filled in Pass 1/2 below.
+    struct KeyRange { int64_t key; int64_t start; int64_t end; int32_t slot; };
+    std::vector<KeyRange> ranges;
+    ranges.reserve(group.size() / 2 + 1);
+    int64_t i = 0;
+    while (i < static_cast<int64_t>(group.size())) {
+      int64_t start = i;
+      int64_t key = group[i].key;
+      while (i < static_cast<int64_t>(group.size()) && group[i].key == key)
+        ++i;
+      ranges.push_back({key, start, i, -1});
+    }
 
-    // ── Pass 1: shared (read) lock, resolve all keys in this bucket
+    // ── Pass 1: shared (read) lock, resolve all existing keys
+    std::vector<int64_t> pending;  // indices into ranges[] needing insertion
     {
       std::shared_lock lock(buckets_[b].mtx);
-      for (const auto& ik : group) {
-        auto it = key_to_slot.find(ik.key);
-        if (it != key_to_slot.end()) continue;  // dedup
-
-        const int32_t* found = buckets_[b].find(ik.key);
+      for (int64_t ri = 0; ri < static_cast<int64_t>(ranges.size()); ++ri) {
+        const int32_t* found = buckets_[b].find(ranges[ri].key);
         if (found) {
-          key_to_slot[ik.key] = *found;
+          ranges[ri].slot = *found;
         } else {
-          key_to_slot[ik.key] = -1;            // needs insert
-          pending_inserts.push_back(ik.key);
+          pending.push_back(ri);
         }
       }
     }  // shared_lock released
 
     // ── Pass 2: exclusive (write) lock, insert new keys in batch
-    if (!pending_inserts.empty()) {
+    if (!pending.empty()) {
       std::unique_lock lock(buckets_[b].mtx);
-      for (int64_t key : pending_inserts) {
+      for (int64_t ri : pending) {
         // Double-check (another thread may have inserted between passes)
-        const int32_t* found = buckets_[b].find(key);
+        const int32_t* found = buckets_[b].find(ranges[ri].key);
         if (found) {
-          key_to_slot[key] = *found;
+          ranges[ri].slot = *found;
           continue;
         }
 
         int32_t new_slot = static_cast<int32_t>(
             num_entries_.fetch_add(1, std::memory_order_acq_rel));
 
-        while (!buckets_[b].insert(key, new_slot)) {
+        while (!buckets_[b].insert(ranges[ri].key, new_slot)) {
           buckets_[b].grow();
         }
-        key_to_slot[key] = new_slot;
-        ++new_count;
+        ranges[ri].slot = new_slot;
+        new_count.fetch_add(1, std::memory_order_relaxed);
       }
     }
 
     // ── Backfill: write slot_indices for all original indices
-    for (const auto& ik : group) {
-      slot_indices[ik.idx] = key_to_slot[ik.key];
+    for (const auto& r : ranges) {
+      for (int64_t j = r.start; j < r.end; ++j) {
+        slot_indices[group[j].idx] = r.slot;
+      }
     }
-  }
+  });
 
-  return new_count;
+  return new_count.load(std::memory_order_relaxed);
 }
 
 void HashTable::find_only(const int64_t* keys, int32_t* slot_indices, int64_t n) const {
+  // Partition keys by bucket, then process each bucket under a single
+  // shared lock (16 locks total instead of one per key).
+  struct IndexedKey { int64_t idx; int64_t key; };
+  std::vector<IndexedKey> bucket_groups[kNumBuckets];
+  for (int b = 0; b < kNumBuckets; ++b) {
+    bucket_groups[b].reserve(static_cast<size_t>(n / kNumBuckets + 16));
+  }
+
   for (int64_t i = 0; i < n; ++i) {
     int64_t key = keys[i];
     if (key < 0) {
@@ -233,10 +258,20 @@ void HashTable::find_only(const int64_t* keys, int32_t* slot_indices, int64_t n)
       continue;
     }
     int b = static_cast<int>(key & 0xF);
-    std::shared_lock lock(buckets_[b].mtx);
-    const int32_t* found = buckets_[b].find(key);
-    slot_indices[i] = found ? *found : -1;
+    bucket_groups[b].push_back({i, key});
   }
+
+  // Process each bucket in parallel (read-only, shared locks only).
+  ThreadPool::instance().parallel_for(kNumBuckets, [&](size_t b) {
+    auto& group = bucket_groups[b];
+    if (group.empty()) return;
+
+    std::shared_lock lock(buckets_[b].mtx);
+    for (const auto& ik : group) {
+      const int32_t* found = buckets_[b].find(ik.key);
+      slot_indices[ik.idx] = found ? *found : -1;
+    }
+  });
 }
 
 std::vector<std::pair<int64_t, int32_t>> HashTable::dump() const {
