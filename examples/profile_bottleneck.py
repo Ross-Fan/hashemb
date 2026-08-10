@@ -53,6 +53,9 @@ def main():
     p.add_argument("--feat-ids", type=int, default=100, help="feat_ids per sample")
     p.add_argument("--feat-space", type=int, default=1_000_000,
                    help="feat_id universe size (keys drawn from [0, feat_space))")
+    p.add_argument("--dup-rate", type=float, default=0.0,
+                   help="feature duplication rate (0.0=all unique, 0.8=80%% duplicate). "
+                        "When >0, keys are drawn from a reduced pool of size N*(1-dup_rate).")
     p.add_argument("--dim", type=int, default=16, help="embedding dim")
     p.add_argument("--capacity", type=int, default=2_000_000)
     p.add_argument("--runs", type=int, default=10)
@@ -69,7 +72,14 @@ def main():
 
     # Reproducible random keys: shape (B, F), drawn from [0, feat_space).
     rng = np.random.default_rng(42)
-    keys_2d = rng.integers(0, args.feat_space, size=(B, F), dtype=np.int64)
+    if args.dup_rate > 0.0:
+        # Draw from a reduced pool so that dup_rate fraction of keys repeat.
+        pool_size = max(1, int(N * (1.0 - args.dup_rate)))
+        pool = rng.integers(0, args.feat_space, size=pool_size, dtype=np.int64)
+        keys_flat = rng.choice(pool, size=N, replace=True)
+        keys_2d = keys_flat.reshape(B, F)
+    else:
+        keys_2d = rng.integers(0, args.feat_space, size=(B, F), dtype=np.int64)
     keys_np = keys_2d.reshape(-1)  # flat (N,) for C++ calls
     unique_keys = np.unique(keys_np)
 
@@ -78,9 +88,9 @@ def main():
     print("=" * 64)
     print(f"samples={B}  feat_ids/sample={F}  total_keys={N}")
     print(f"feat_space={args.feat_space}  dim={D}  capacity={args.capacity}")
-    print(f"optimizer={args.optimizer}  lr={args.lr}")
+    print(f"dup_rate={args.dup_rate:.0%}  optimizer={args.optimizer}  lr={args.lr}")
     print(f"runs={runs}  warmup={warmup}")
-    print(f"unique keys in batch: {len(unique_keys)} / {N}")
+    print(f"unique keys in batch: {len(unique_keys)} / {N} ({len(unique_keys)/N:.1%})")
     print()
 
     # ══════════════════════════════════════════════════════════════════
