@@ -185,21 +185,42 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
   }
   if (max_slot >= 0) ensure_slot(max_slot);
 
-  // Single-threaded: simple loop, no sorting/grouping overhead.
-  // This operation is memory-bandwidth bound (random DDR writes),
-  // so parallelisation does not help — it only adds overhead.
+  // Partition by slot & 0xF so duplicate slots (same key) always land in
+  // the same shard — no data race on grad accumulation.  Different slots
+  // in different shards write to different grad memory → no conflict.
+  struct GradEntry { int32_t slot; int64_t idx; };
+  std::vector<GradEntry> shards[kNumBuckets];
+  for (int b = 0; b < kNumBuckets; ++b) {
+    shards[b].reserve(static_cast<size_t>(n / kNumBuckets + 16));
+  }
   for (int64_t i = 0; i < n; ++i) {
     int32_t slot = slot_indices[i];
     if (slot < 0) continue;
+    shards[static_cast<int>(slot & 0xF)].push_back({slot, i});
+  }
 
-    float* grad_dst = slot_ptr(grad_blocks_, slot, D, bs);
-    const float* g = grads + i * D;
-    for (int32_t d = 0; d < D; ++d) grad_dst[d] += g[d];
+  // Per-thread dirty slot tracking (merged after parallel section).
+  std::vector<int32_t> local_dirty[kNumBuckets];
 
-    if (!slot_dirty_[slot]) {
-      slot_dirty_[slot] = true;
-      dirty_slots_.push_back(slot);
+  ThreadPool::instance().parallel_for(kNumBuckets, [&](size_t b) {
+    auto& shard = shards[b];
+    for (const auto& e : shard) {
+      int32_t slot = e.slot;
+      float* grad_dst = slot_ptr(grad_blocks_, slot, D, bs);
+      const float* g = grads + e.idx * D;
+      for (int32_t d = 0; d < D; ++d) grad_dst[d] += g[d];
+
+      if (!slot_dirty_[slot]) {
+        slot_dirty_[slot] = true;
+        local_dirty[b].push_back(slot);
+      }
     }
+  });
+
+  // Merge per-thread dirty slots into the global dirty_slots_.
+  for (int b = 0; b < kNumBuckets; ++b) {
+    dirty_slots_.insert(dirty_slots_.end(),
+                        local_dirty[b].begin(), local_dirty[b].end());
   }
 }
 
