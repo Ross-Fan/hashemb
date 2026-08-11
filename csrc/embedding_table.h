@@ -178,6 +178,12 @@ class EmbeddingTable {
   int64_t num_entries() const { return hash_table_.num_entries(); }
   const OptimizerConfig& opt_config() const { return opt_cfg_; }
 
+  // Profiling accessors (microseconds).
+  int64_t last_find_or_create_us() const { return last_find_or_create_us_; }
+  int64_t last_lookup_us() const { return last_lookup_us_; }
+  int64_t last_scatter_add_grad_us() const { return last_scatter_add_grad_us_; }
+  int64_t last_step_us() const { return last_step_us_; }
+
  private:
   /// Ensure blocks exist for the given slot_id (allocate if needed).
   void ensure_slot(int64_t slot_id);
@@ -207,6 +213,13 @@ class EmbeddingTable {
   // different bools from parallel threads (adjacent bits share the same byte).
   std::vector<uint8_t> slot_dirty_;
   std::vector<int32_t> dirty_slots_;
+
+  // Profiling: last operation duration in microseconds (mutable so const
+  // methods like lookup_existing can also record timings).
+  mutable int64_t last_find_or_create_us_ = 0;
+  mutable int64_t last_lookup_us_ = 0;
+  mutable int64_t last_scatter_add_grad_us_ = 0;
+  mutable int64_t last_step_us_ = 0;
 
   HashTable hash_table_;
 };

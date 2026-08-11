@@ -145,6 +145,7 @@ void EmbeddingTable::lookup(const int32_t* slot_indices, float* output,
 
 void EmbeddingTable::lookup_and_gather(const int64_t* keys, float* output,
                                        int32_t* slot_indices, int64_t n) {
+  auto t0 = std::chrono::steady_clock::now();
   hash_table_.find_or_create(keys, slot_indices, n);
 
   // Ensure backing blocks for the maximum slot ID assigned.
@@ -153,19 +154,28 @@ void EmbeddingTable::lookup_and_gather(const int64_t* keys, float* output,
     if (slot_indices[i] > max_slot) max_slot = slot_indices[i];
   }
   if (max_slot >= 0) ensure_slot(max_slot);
+  auto t1 = std::chrono::steady_clock::now();
 
   lookup(slot_indices, output, n);
+  auto t2 = std::chrono::steady_clock::now();
+
+  last_find_or_create_us_ = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  last_lookup_us_ = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
 }
 
 void EmbeddingTable::lookup_existing(const int64_t* keys, float* output, int64_t n) const {
-  int32_t D = embedding_dim_;
-
+  auto t0 = std::chrono::steady_clock::now();
   // Find existing keys (-1 for unknown).
   std::vector<int32_t> slots(static_cast<size_t>(n));
   hash_table_.find_only(keys, slots.data(), n);
+  auto t1 = std::chrono::steady_clock::now();
 
   // lookup already handles slot < 0 as zeros.
   lookup(slots.data(), output, n);
+  auto t2 = std::chrono::steady_clock::now();
+
+  last_find_or_create_us_ = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  last_lookup_us_ = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
 }
 
 // ===========================================================================
@@ -175,6 +185,7 @@ void EmbeddingTable::lookup_existing(const int64_t* keys, float* output, int64_t
 void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
                                       const float* grads,
                                       int64_t n) {
+  auto t0 = std::chrono::steady_clock::now();
   int32_t D = embedding_dim_;
   int64_t bs = block_size_;
 
@@ -222,6 +233,8 @@ void EmbeddingTable::scatter_add_grad(const int32_t* slot_indices,
     dirty_slots_.insert(dirty_slots_.end(),
                         local_dirty[b].begin(), local_dirty[b].end());
   }
+  auto t1 = std::chrono::steady_clock::now();
+  last_scatter_add_grad_us_ = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 }
 
 // ===========================================================================
@@ -241,10 +254,15 @@ void EmbeddingTable::zero_grad() {
 }
 
 void EmbeddingTable::step() {
+  auto t0 = std::chrono::steady_clock::now();
   int32_t D = embedding_dim_;
   int64_t bs = block_size_;
   size_t ndirty = dirty_slots_.size();
-  if (ndirty == 0) return;
+  if (ndirty == 0) {
+    auto t1 = std::chrono::steady_clock::now();
+    last_step_us_ = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    return;
+  }
 
   if (opt_cfg_.type == OptimizerConfig::SGD) {
     float lr = opt_cfg_.lr;
@@ -308,6 +326,8 @@ void EmbeddingTable::step() {
 
   dirty_slots_.clear();
   // Note: gradients zeroed in-place above — no separate zero_grad() call needed.
+  auto t1 = std::chrono::steady_clock::now();
+  last_step_us_ = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 }
 
 // ===========================================================================

@@ -205,6 +205,12 @@ class PyHashEmbedding {
   int32_t embedding_dim() const { return table_.embedding_dim(); }
   int64_t num_entries() const { return table_.num_entries(); }
 
+  // Profiling: last C++ operation duration in microseconds.
+  int64_t last_find_or_create_us() const { return table_.last_find_or_create_us(); }
+  int64_t last_lookup_us() const { return table_.last_lookup_us(); }
+  int64_t last_scatter_add_grad_us() const { return table_.last_scatter_add_grad_us(); }
+  int64_t last_step_us() const { return table_.last_step_us(); }
+
  private:
   EmbeddingTable table_;
 
@@ -284,5 +290,9 @@ PYBIND11_MODULE(_hashemb_cpp, m) {
       // Properties
       .def_property_readonly("capacity", &hashemb::PyHashEmbedding::capacity)
       .def_property_readonly("embedding_dim", &hashemb::PyHashEmbedding::embedding_dim)
-      .def_property_readonly("num_entries", &hashemb::PyHashEmbedding::num_entries);
+      .def_property_readonly("num_entries", &hashemb::PyHashEmbedding::num_entries)
+      .def_property_readonly("last_find_or_create_us", &hashemb::PyHashEmbedding::last_find_or_create_us)
+      .def_property_readonly("last_lookup_us", &hashemb::PyHashEmbedding::last_lookup_us)
+      .def_property_readonly("last_scatter_add_grad_us", &hashemb::PyHashEmbedding::last_scatter_add_grad_us)
+      .def_property_readonly("last_step_us", &hashemb::PyHashEmbedding::last_step_us);
 }
