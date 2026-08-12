@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -79,7 +80,14 @@ class ThreadPool {
  private:
   ThreadPool() {
     int hw = static_cast<int>(std::thread::hardware_concurrency());
-    nworkers_ = hw > 1 ? hw - 1 : 0;  // leave 1 core for master
+    // Cap workers: the smallest parallel workload is 16 hash-table buckets,
+    // so more than 15 workers provides no benefit.  Excess idle threads waste
+    // stack memory (8MB each) and pollute L3 cache, which degrades performance
+    // on high-core-count machines (e.g. 48-core Docker creating 47 idle
+    // threads → 376MB stack + L3 contention, AND 16 < 48 triggers the
+    // sequential fallback in parallel_for).
+    static constexpr int kMaxWorkers = 15;
+    nworkers_ = hw > 1 ? std::min(hw - 1, kMaxWorkers) : 0;
     if (nworkers_ > 0) {
       barrier_.init(nworkers_ + 1);
       for (int i = 0; i < nworkers_; ++i) {
