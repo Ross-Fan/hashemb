@@ -1,4 +1,404 @@
+**English** | [中文](#中文说明)
+
 # HashEmb — CPU Host-Memory Hash Embedding Table for PyTorch
+
+## Overview
+
+HashEmb is a high-performance hash embedding table library backed by CPU host memory (DDR), designed for large-scale sparse embeddings in search / recommendation / advertising systems.
+
+### Core Idea
+
+Store the large sparse embedding table in CPU host memory (DDR, scaling to terabytes), keep the dense model on the GPU (HBM), implement the underlying high-performance hash table in C++ and expose it to PyTorch via a pybind11 wrapper, and move data between CPU and GPU over PCIe.
+
+```
+┌───────────────────────────────────────────────┐
+│                   GPU (HBM)                     │
+│  ┌─────────────────────────────────────────┐   │
+│  │  Dense Network (MLP / Transformer etc.) │   │
+│  │  Embedding Tensor (GPU pinned buffer)   │   │
+│  └─────────────────────────────────────────┘   │
+│            ▲ PCIe (DMA, pinned memory)          │
+│            │                                     │
+│  ┌────────┴────────────────────────────────┐   │
+│  │           CPU (DDR)                       │   │
+│  │  ┌──────────────────────────────────┐    │   │
+│  │  │  C++ Hash Embedding Table        │    │   │
+│  │  │  • Robin Hood open addressing    │    │   │
+│  │  │  • 16-way internal sharding      │    │   │
+│  │  │  • Block-based on-demand alloc   │    │   │
+│  │  │  • Native SGD / Adam optimizers  │    │   │
+│  │  └──────────────────────────────────┘    │   │
+│  │            ↕ pybind11                     │   │
+│  │  ┌──────────────────────────────────┐    │   │
+│  │  │  PyTorch Wrapper                 │    │   │
+│  │  │  • autograd.Function             │    │   │
+│  │  │  • nn.Module (HashEmbedding)     │    │   │
+│  │  │  • Checkpoint serialisation      │    │   │
+│  │  └──────────────────────────────────┘    │   │
+│  └──────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────┘
+```
+
+## Installation & Build
+
+### Requirements
+
+| Dependency | Notes |
+|---|---|
+| Python | ≥ 3.8 |
+| C++ compiler | GCC ≥ 7 / Clang (macOS) |
+| PyTorch | ≥ 1.13 |
+| pybind11 | fetched automatically by setup.py |
+
+### Build
+
+```bash
+# Install from source (compiles the C++ extension automatically)
+pip install -e .
+
+# Compile the C++ extension only
+python setup.py build_ext --inplace
+
+# Verify the installation
+python -c "from hashemb import HashEmbedding; print('OK')"
+
+# Run the full test suite
+python -m pytest tests/ -v
+```
+
+> **Note**: the C++ extension (`.so` / `.pyd`) is platform-specific and **must be recompiled on the target machine**.
+
+### Rebuild after changing C++
+
+```bash
+python setup.py build_ext --inplace
+```
+
+### Running tests
+
+```bash
+# Full suite (C++ core + PyTorch wrapper)
+python -m pytest tests/ -v
+
+# A single test file
+python -m pytest tests/test_dynamic_expansion.py -v -s
+
+# CPU-only tests
+python -m pytest tests/ -v -k "not cuda"
+
+# ML-1M real-data benchmark (download the ml-1m dataset first)
+python examples/compare_ml1m.py
+```
+
+## Quick Start
+
+```python
+import numpy as np
+import torch
+from hashemb import HashEmbedding
+
+# ── Create the hash embedding table (CPU memory, allocated on demand) ──
+emb = HashEmbedding(
+    embedding_dim=64,
+    capacity=10_000_000,     # initial capacity hint (NOT a hard limit)
+    optimizer="adam", lr=0.001,
+    block_size=10_000_000,   # allocate one block per 10M slots
+)
+
+# ── Training loop ──
+for batch in loader:
+    keys = batch["feat_ids"]              # (B, S) int64, on GPU/MPS
+    out = emb(keys)                       # (B, S, D) auto-transferred to the target device
+    loss = F.cross_entropy(dense(out), y)
+    loss.backward()                       # gradients accumulate into the C++ grad_buffer
+    dense_optim.step()                    # update dense parameters
+    emb.step()                            # C++ Adam/SGD update + zero grad_buffer
+
+# ── Save a checkpoint ──
+# Save the dense model with torch.save
+torch.save({"dense": dense.state_dict()}, "dense.pt")
+
+# Save the hash embedding table to a binary format (streamed per bucket, zero extra memory)
+# Optional eviction filters low-frequency / stale features
+emb.save("emb.hashemb", min_count=5, max_idle_steps=5000)
+
+# ── Load and resume training ──
+dense.load_state_dict(torch.load("dense.pt"))
+
+# Re-create a table with the same spec, then load the binary file
+emb = HashEmbedding(embedding_dim=64, capacity=10_000_000, optimizer="adam", lr=0.001)
+emb.load("emb.hashemb")
+
+# ── Export for serving / inspection ──
+# Extract keys and embeddings from a saved checkpoint into NPZ files
+# Writes embeddings_bucket_00.npz ... embeddings_bucket_15.npz
+from hashemb.utils import export_hashemb_to_npz
+
+export_hashemb_to_npz("emb.hashemb", "embeddings.npz", embedding_dim=64, capacity=10_000_000)
+
+embedding_by_key = {}
+for bucket_id in range(16):
+    z = np.load(f"embeddings_bucket_{bucket_id:02d}.npz")
+    for key, vector in zip(z["keys"], z["embeddings"]):
+        embedding_by_key[int(key)] = vector
+```
+
+`save()` is for training checkpoints / resume; `export_hashemb_to_npz()` exports from a saved checkpoint and writes only `(hash_id, embedding)`. It writes 16 files, `embeddings_bucket_00.npz` to `embeddings_bucket_15.npz`, one per hash bucket, so the whole table is never materialized at once (avoids OOM). Each bucket file contains only key/vector data and basic metadata; export order is not guaranteed, so consumers should align by `keys`.
+
+## Core Design
+
+### Block-Based On-Demand Storage
+
+Instead of pre-allocating one large `[capacity, D]` contiguous buffer, embeddings use **append-on-demand blocks**:
+
+- Each block holds 10M slots by default (`block_size` configurable)
+- New blocks are appended automatically when full — no hard capacity limit
+- grad / m / v are allocated on demand the same way (m/v only for Adam)
+- Suited to hundreds-of-billions of features / terabyte-scale embeddings
+
+```
+hash table:   feat_id → slot_index (auto-grows)
+block chain:  [block_0 | block_1 | ... | block_N]  each block = [block_size, D]
+
+lookup:   key[0] → find_or_create → slot_5 → block_0[5]
+step():   direct ptr = base_data + slot * D  (single-block fast path, no division)
+```
+
+### Auto-Grow Buckets
+
+- Each bucket starts with 25% slack based on the `capacity` hint (load factor ≤ 0.8)
+- When full it doubles and rehashes — no hard limit to configure
+- No `hash_int64` second hash (feat_id is already uniform; use `key & 0xF` to pick the bucket)
+
+### Unified Single Table
+
+All features share one hash embedding table. `embedding_dim` is global.
+
+```
+Table: HashTable
+  ├── Bucket 0  │ key_0 │ key_1 │ ... │ key_n │
+  ├── Bucket 1  │ key_0 │ key_1 │ ... │ key_n │
+  ├── ...
+  └── Bucket 15 │ key_0 │ key_1 │ ... │ key_n │
+```
+
+### Lookup Semantics (rank-lifting only, never reducing)
+
+| Input shape | Output shape |
+|---|---|
+| `(B,)` | `(B, D)` |
+| `(B, S)` | `(B, S, D)` |
+| `(B, F, S)` | `(B, F, S, D)` |
+
+- Sequence structure is preserved — no forward pooling
+- Automatic cross-device transfer (CPU lookup → GPU forward → backward)
+
+### Backward Semantics
+
+- Equivalent to PyTorch `nn.Embedding`'s `index_add_` behavior
+- Duplicate feat_ids in the same batch have their gradients **summed**
+- Accumulated in `autograd.Function.backward()` via the C++ `scatter_add_grad`
+
+> **Note**: PyTorch's `grad_output` may be non-C-contiguous (e.g. from strided ops).
+> The Python side calls `.contiguous().numpy()` so C++ reads the correct memory layout.
+
+### Native Optimizers (implemented in C++)
+
+| Optimizer | step update | State |
+|---|---|---|
+| SGD | `w -= lr * g` | weight + grad |
+| Adam | `m = b1*m + (1-b1)g; v = b2*v + (1-b2)g^2; w -= lr * m_hat/(√v̂ + ɛ)` | weight + grad + m + v + t |
+
+- The gradient is **zeroed in place** in the `step()` inner loop, avoiding the full `zero_grad()` memset
+- The single-block case uses **direct pointer arithmetic** `base_ptr + slot * D`, avoiding the division in `slot_ptr()`
+
+### Training Pattern (BigModel / per-field tables)
+
+```python
+class FeatureEmbedder(torch.nn.Module):
+    """One independent HashEmbedding per field (ID spaces may overlap)."""
+    def __init__(self, feature_names, dim, capacity):
+        for name in feature_names:
+            self.__setattr__(f"emb_{name}", HashEmbedding(dim, capacity, ...))
+
+    def forward(self, feat_dict):
+        return {name: getattr(self, f"emb_{name}")(feat_dict[name])
+                for name in self.feature_names}
+
+    def step(self):
+        for name in self.feature_names:
+            getattr(self, f"emb_{name}").step()
+```
+
+### Key Eviction
+
+As training proceeds the table keeps growing (new feat_ids keep being inserted). **Eviction** periodically prunes low-frequency or stale features to bound memory usage.
+
+#### How it works
+
+The C++ side maintains per-slot statistics in every `step()`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `update_count` | uint32 | cumulative number of step() updates for this key |
+| `last_step` | uint32 | global_step of the most recent step() update |
+| `global_step_` | int64 | global monotonically increasing step counter |
+
+Eviction happens **at save time**: only keys passing the filter are written to the binary file. Loading it back yields a compacted table.
+
+```
+train N steps → save(with eviction) → load → continue training
+  table grows        keep important keys only    table compacted
+```
+
+#### Eviction parameters
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `min_count` | 0 (disabled) | evict keys with `update_count < min_count` |
+| `max_idle_steps` | 0 (disabled) | evict keys with `(global_step - last_step) > max_idle_steps` |
+| `combine` | `"and"` | when both conditions are enabled: `"and"` = evict only if both hold (conservative); `"or"` = evict if either holds |
+
+- Only `min_count` (`max_idle_steps=0`): frequency only
+- Only `max_idle_steps` (`min_count=0`): idle time only
+- Both set to 0: no eviction, equivalent to a plain save
+
+#### Example
+
+```python
+import torch
+from hashemb import HashEmbedding
+
+# ── Phase 1: train several epochs; the table keeps growing ──
+emb = HashEmbedding(embedding_dim=64, capacity=10_000_000, optimizer="adam", lr=0.001)
+
+for epoch in range(10):
+    for batch in loader:
+        out = emb(batch["feat_ids"])
+        loss = model(out, batch["labels"])
+        loss.backward()
+        emb.step()
+
+print(f"keys before eviction: {emb.num_entries:,}")  # e.g. 12,345,678
+
+# ── Phase 2: evict low-frequency features (keep keys updated > 10 times) ──
+emb.save("emb_filtered.hashemb", min_count=10)
+
+# ── Phase 3: rebuild a table and load the compacted data ──
+emb2 = HashEmbedding(embedding_dim=64, capacity=10_000_000, optimizer="adam", lr=0.001)
+emb2.load("emb_filtered.hashemb")
+print(f"keys after eviction: {emb2.num_entries:,}")  # e.g. 2,345,678
+
+# ── Phase 4: continue training ──
+# Stats are preserved, so eviction params still apply on the next save
+for epoch in range(10):
+    for batch in loader:
+        out = emb2(batch["feat_ids"])
+        loss.backward()
+        emb2.step()
+
+# Evict again: keys updated < 20 times OR idle > 10000 steps
+emb2.save("emb_filtered2.hashemb", min_count=20, max_idle_steps=10000, combine="or")
+```
+
+#### Typical policies
+
+| Scenario | Settings | Effect |
+|---|---|---|
+| Daily cleanup | `min_count=5, max_idle_steps=20000` | prune low-frequency and stale noise features |
+| Idle-only cleanup | `min_count=0, max_idle_steps=50000` | keep all active features, drop zombie keys |
+| Frequency-only cleanup | `min_count=100, max_idle_steps=0` | keep only truly hot features, aggressively prune the long tail |
+| Conservative (default) | `min_count=0, max_idle_steps=0` | no eviction, keep every key |
+
+> **Note**: `global_step_` is persisted to the binary file, so `max_idle_steps` spans the save/load boundary. E.g. save after 10k steps, load, train 5k more → `global_step_` = 15k; the kept keys have `last_step` ≤ 10k and won't be wrongly evicted.
+
+#### Without eviction: `state_dict` / `torch.save`
+
+The binary save/load is designed for eviction and large tables. If you don't need eviction you can keep using `state_dict()` + `torch.save` (beware OOM on large tables):
+
+```python
+torch.save({
+    "hash_emb": emb.state_dict(),
+    "dense": dense.state_dict(),
+}, "checkpoint.pt")
+
+# Restore
+ckpt = torch.load("checkpoint.pt")
+emb.load_state_dict(ckpt["hash_emb"])
+```
+
+## Project Structure
+
+```
+hashemb/
+├── setup.py                        # Python package build config
+├── CLAUDE.md                       # Claude Code working instructions
+├── README.md                       # Project design doc (this file)
+├── csrc/                           # C++ core source
+│   ├── hash_table.h                # Robin Hood hash map + 16-way sharding + auto-grow
+│   ├── hash_table.cpp
+│   ├── embedding_table.h           # Block-based storage + batch ops + native optimizers
+│   ├── embedding_table.cpp
+│   └── pybind_binding.cpp          # pybind11 → Python bridge
+├── hashemb/                        # Python package
+│   ├── __init__.py
+│   ├── core.py                     # PyTorch autograd + nn.Module wrapper
+│   └── utils.py
+├── examples/
+│   ├── demo.py                     # basic usage example
+│   └── compare_ml1m.py             # ML-1M nn.Embedding vs HashEmb comparison
+└── tests/
+    ├── test_basic.py               # C++ core + PyTorch wrapper tests (21 cases)
+    ├── test_adam_verify.py         # C++ Adam vs PyTorch manual Adam, step by step
+    ├── test_dynamic_expansion.py   # dynamic expansion stress test (capacity=100, 1000 inserts)
+    ├── test_pure_torch_vs_hash.py  # nn.Embedding vs HashEmb, step by step (SGD + Adam)
+    ├── test_submodel.py            # BigModel architecture test (multi-field + sequence + cross-device)
+    └── test_eviction.py            # eviction tests (24 cases)
+```
+
+## Performance (ML-1M, 1M ratings, 802K training samples)
+
+Architecture: per-field embedding concat → Linear(2×16, 1) → sigmoid
+
+| Model | AUC | Time/epoch | Relative to nn.Embedding |
+|---|---|---|---|
+| nn.Embedding (GPU) | 0.7911 | 1.11s | 1.0x |
+| HashEmb (CPU) | 0.7910 | **1.22s** | **1.1x** |
+
+> Environment: Apple M2 CPU-only, batch_size=1024, dim=16, Adam LR=0.01, 20 epochs.
+
+## Roadmap
+
+### V1 ✅ (current)
+- [x] C++ hash table core (Robin Hood + auto-grow buckets + 16-way sharding)
+- [x] Block-based on-demand allocation (no hard capacity limit)
+- [x] Native SGD + Adam optimizers (in C++, with m/v/t state)
+- [x] pybind11 bindings (numpy / torch tensor interface)
+- [x] PyTorch autograd wrapper (correct non-contiguous gradient handling)
+- [x] Checkpoint persistence (keys + slots + weight + grad + optimizer state)
+- [x] Performance: direct pointer arithmetic + in-place grad zeroing (step() 72ms → 0.09ms)
+- [x] ML-1M validation: AUC 0.7910 vs nn.Embedding 0.7911
+- [x] Binary save/load (streamed per bucket, zero extra memory, avoids OOM on large tables)
+- [x] Key eviction (update_count / last_step stats + hard-rule filtering)
+
+### V2 — Performance (planned)
+- [ ] Pinned memory buffer pooling
+- [ ] Multi-threaded concurrent lookup
+- [ ] Asynchronous prefetch pipeline
+
+### V3 — Advanced (planned)
+- [ ] GPU HBM hot-key cache (LRU / K-LRU)
+- [ ] Swap-in / swap-out overlapped with compute
+- [ ] Multi-GPU All-to-All sharded routing
+
+## References
+
+- [TorchRec](https://github.com/pytorch/torchrec) — PyTorch recommendation library
+- [FBGEMM](https://github.com/pytorch/FBGEMM) — Facebook quantization & embedding library
+
+---
+
+# 中文说明
 
 ## 概述
 
